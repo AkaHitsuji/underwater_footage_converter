@@ -1,0 +1,36 @@
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore temporary files
+temp_frames/
+*.log
+
+# Ignore virtual environment
+venv/
+.env/
+env/
+.venv/
+
+# Ignore output files
+*_converted.*
+*_converted_v2.*
+
+# Ignore input test files
+*.MOV
+*.mov
+*.mp4
+*.avi
+*.jpg
+*.png
+
+# Ignore test media files, but keep the directories
+test_videos/*
+!test_videos/.gitkeep
+test_images/*
+!test_images/.gitkeep
+
+# Ignore temporary processing files
+.DS_Store
+Thumbs.db
