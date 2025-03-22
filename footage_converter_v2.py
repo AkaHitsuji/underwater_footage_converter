@@ -14,6 +14,7 @@ import time
 import multiprocessing
 import signal
 import sys
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
@@ -216,6 +217,99 @@ class UnderwaterImageProcessor:
         cv2.imwrite(output_frame_path, corrected)
         return True
 
+    def _run_ffmpeg_with_progress(self, command, total_frames, description="Processing"):
+        """Run FFmpeg command with progress monitoring"""
+        # Create a temporary file for FFmpeg progress
+        progress_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
+        progress_file.close()
+        
+        # Add progress monitoring to the command
+        full_command = command.copy()  # Create a copy to avoid modifying the original
+        
+        # Add stats and progress options
+        if '-y' not in full_command:
+            full_command = [full_command[0], '-y'] + full_command[1:]  # Add overwrite flag
+        full_command.extend(['-stats', '-progress', progress_file.name])
+        
+        # Start FFmpeg process
+        process = subprocess.Popen(
+            full_command, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE
+        )
+        
+        # Setup progress bar
+        pbar = tqdm(total=total_frames, desc=description)
+        
+        # Monitor progress
+        last_frame = 0
+        stalled_count = 0  # Counter to detect if progress is stuck
+        
+        try:
+            while process.poll() is None:
+                try:
+                    time.sleep(0.5)  # Check progress every half second
+                    
+                    if os.path.exists(progress_file.name) and os.path.getsize(progress_file.name) > 0:
+                        with open(progress_file.name, 'r') as f:
+                            progress_text = f.read()
+                        
+                        frame_match = re.search(r'frame=\s*(\d+)', progress_text)
+                        if frame_match:
+                            current_frame = int(frame_match.group(1))
+                            if current_frame > last_frame:
+                                pbar.update(current_frame - last_frame)
+                                last_frame = current_frame
+                                stalled_count = 0  # Reset stall counter
+                            else:
+                                stalled_count += 1
+                except (IOError, FileNotFoundError):
+                    pass  # File not ready yet
+                
+                # If progress appears stuck but process is still running,
+                # just update the progress bar a little to show activity
+                if stalled_count > 10 and last_frame < total_frames:  
+                    pbar.set_description(f"{description} (estimating...)")
+                    # Avoid updating beyond total
+                    if last_frame < total_frames - 1:
+                        pbar.update(1)
+                        last_frame += 1
+                    stalled_count = 0
+            
+            # Get the process result
+            stdout, stderr = process.communicate()
+            stderr_text = stderr.decode('utf-8', errors='ignore') if stderr else ""
+            
+            # Ensure progress bar reaches 100% when process completes successfully
+            if process.returncode == 0 and last_frame < total_frames:
+                pbar.update(total_frames - last_frame)
+            
+            # Check if process completed successfully
+            if process.returncode != 0:
+                logger.error(f"FFmpeg process failed with return code {process.returncode}")
+                logger.error(f"Error output: {stderr_text}")
+                raise subprocess.CalledProcessError(process.returncode, full_command, 
+                                                   output=stdout, stderr=stderr)
+                
+            return process.returncode
+            
+        finally:
+            # Always clean up, even if there's an exception
+            pbar.close()
+            # Kill the process if it's still running
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            # Remove temporary file
+            try:
+                if os.path.exists(progress_file.name):
+                    os.unlink(progress_file.name)
+            except:
+                pass
+
     def process_video(self, input_path, output_path, fps=None, num_workers=None):
         """
         Process a video file
@@ -258,13 +352,21 @@ class UnderwaterImageProcessor:
             # Extract frames using ffmpeg (more efficient than OpenCV for extraction)
             logger.info("Extracting frames with ffmpeg...")
             frames_path = os.path.join(temp_dir, "frame_%04d.jpg")
+            
             # Use high-quality extraction for better results
-            subprocess.run([
+            extraction_command = [
                 'ffmpeg', '-i', input_path, '-qscale:v', '2', 
                 # Use multiple threads for extraction
                 '-threads', str(num_workers),
                 frames_path
-            ], check=True, capture_output=True)
+            ]
+            
+            # Use new progress monitoring method
+            self._run_ffmpeg_with_progress(
+                extraction_command, 
+                frame_count, 
+                "Extracting frames"
+            )
             
             # Process frames in parallel
             frame_files = sorted([f for f in os.listdir(temp_dir) if f.startswith("frame_")])
@@ -292,7 +394,7 @@ class UnderwaterImageProcessor:
                     ))
                 
                 # Process results as they complete
-                progress_bar = tqdm(total=len(futures))
+                progress_bar = tqdm(total=len(futures), desc="Processing frames")
                 for future, i, filename in [(f[0], f[1], f[2]) for f in futures]:
                     if future.done() or future.running():
                         try:
@@ -322,7 +424,8 @@ class UnderwaterImageProcessor:
             
             # First create the video with processed frames, maintaining original dimensions
             logger.info(f"Creating video at {width}x{height} resolution...")
-            subprocess.run([
+            
+            encoding_command = [
                 'ffmpeg', '-r', str(fps), 
                 '-i', os.path.join(temp_dir, "corrected_%04d.jpg"),
                 # Use optimized encoding settings
@@ -333,11 +436,19 @@ class UnderwaterImageProcessor:
                 # Add these options to maintain original orientation and size
                 '-vf', f'scale={width}:{height}',
                 temp_output
-            ], check=True, capture_output=True)
+            ]
+            
+            # Use new progress monitoring method for encoding
+            self._run_ffmpeg_with_progress(
+                encoding_command, 
+                completed_frames, 
+                "Creating video"
+            )
             
             # Then copy the metadata from original to new video
             logger.info("Applying original metadata to the processed video...")
-            subprocess.run([
+            
+            final_command = [
                 'ffmpeg', '-i', temp_output, 
                 '-i', input_path, 
                 '-map', '0:v', '-map_metadata', '1',
@@ -346,7 +457,14 @@ class UnderwaterImageProcessor:
                 # Copy streams without re-encoding
                 '-c', 'copy',
                 output_path
-            ], check=True, capture_output=True)
+            ]
+            
+            # This step can also benefit from progress tracking
+            self._run_ffmpeg_with_progress(
+                final_command,
+                1,  # Only one "frame" for metadata copying
+                "Finalizing video"
+            )
             
             elapsed_time = time.time() - start_time
             logger.info(f"Saved corrected video: {output_path}")
