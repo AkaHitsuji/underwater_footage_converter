@@ -475,10 +475,78 @@ class UnderwaterImageProcessor:
                 logger.info("Cleaning up temporary files...")
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def process_batch(self, input_folder, output_folder, fps=None, num_workers=None):
+        """
+        Process all supported files in a folder
+        
+        Args:
+            input_folder: Path to input folder containing images and/or videos
+            output_folder: Path to save processed files
+            fps: Frames per second for videos (if None, detect from source)
+            num_workers: Number of parallel workers (defaults to CPU count)
+        """
+        start_time = time.time()
+        
+        # Create output folder if it doesn't exist
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # Get all files in the input folder
+        input_files = []
+        for root, _, files in os.walk(input_folder):
+            for file in files:
+                file_path = os.path.join(root, file)
+                # Check if file is a supported image or video
+                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff', 
+                                       '.mp4', '.avi', '.mov', '.mkv')):
+                    input_files.append(file_path)
+        
+        if not input_files:
+            logger.warning(f"No supported files found in {input_folder}")
+            return
+            
+        logger.info(f"Found {len(input_files)} files to process in {input_folder}")
+        
+        # Process each file
+        successful = 0
+        failed = 0
+        
+        for input_file in tqdm(input_files, desc="Processing files"):
+            if terminate_requested:
+                logger.info("Termination requested. Stopping batch processing.")
+                break
+                
+            try:
+                # Determine relative path to maintain folder structure
+                rel_path = os.path.relpath(input_file, input_folder)
+                output_file = os.path.join(output_folder, rel_path)
+                
+                # Create necessary subdirectories
+                os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                
+                file_lower = input_file.lower()
+                if file_lower.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
+                    logger.info(f"Processing image: {input_file}")
+                    self.process_image(input_file, output_file)
+                    successful += 1
+                elif file_lower.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                    logger.info(f"Processing video: {input_file}")
+                    self.process_video(input_file, output_file, fps=fps, num_workers=num_workers)
+                    successful += 1
+            except Exception as e:
+                logger.error(f"Error processing {input_file}: {e}")
+                failed += 1
+        
+        elapsed_time = time.time() - start_time
+        if terminate_requested:
+            logger.info(f"Batch processing terminated. Processed {successful} files successfully, {failed} failed.")
+        else:
+            logger.info(f"Batch processing completed. Processed {successful} files successfully, {failed} failed.")
+        logger.info(f"Total processing time: {elapsed_time:.2f} seconds")
+
 def main():
     parser = argparse.ArgumentParser(description="Enhance underwater images and videos by restoring natural colors.")
-    parser.add_argument("input", help="Path to the input image or video file.")
-    parser.add_argument("--output", "-o", help="Path to save the corrected output file. If not provided, defaults to '<original_file_name>_converted.<original_filetype>'.")
+    parser.add_argument("input", help="Path to the input image, video file, or folder containing images/videos.")
+    parser.add_argument("--output", "-o", help="Path to save the corrected output file or folder. If not provided, defaults to '<original_file_name>_converted.<original_filetype>' or '<original_folder_name>_converted'.")
     parser.add_argument("--dehaze", "-d", type=float, default=0.5, help="Strength of dehazing effect (0.0-1.0)")
     parser.add_argument("--clahe", "-c", type=float, default=3.0, help="CLAHE clip limit for contrast enhancement")
     parser.add_argument("--saturation", "-s", type=float, default=1.5, help="Saturation boost factor")
@@ -487,6 +555,7 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     parser.add_argument("--workers", "-w", type=int, help="Number of worker threads for parallel processing (default: CPU count)")
     parser.add_argument("--fast", "-f", action="store_true", help="Use faster processing with slightly lower quality")
+    parser.add_argument("--batch", "-b", action="store_true", help="Process input as a folder containing multiple files")
     
     args = parser.parse_args()
     
@@ -495,14 +564,17 @@ def main():
         logging.getLogger('UnderwaterConverter').setLevel(logging.DEBUG)
     
     logger.info("Underwater Footage Converter v2.0")
-    logger.info(f"Input file: {args.input}")
+    logger.info(f"Input: {args.input}")
     
-    # Generate output filename if not provided
+    # Generate output filename/folder if not provided
     if not args.output:
         input_path = Path(args.input)
-        args.output = str(input_path.with_name(f"{input_path.stem}_converted{input_path.suffix}"))
+        if os.path.isdir(args.input) or args.batch:
+            args.output = str(input_path.with_name(f"{input_path.name}_converted"))
+        else:
+            args.output = str(input_path.with_name(f"{input_path.stem}_converted{input_path.suffix}"))
     
-    logger.info(f"Output file: {args.output}")
+    logger.info(f"Output: {args.output}")
     
     # Adjust parameters for fast mode
     if args.fast:
@@ -520,15 +592,21 @@ def main():
     
     logger.info(f"Processing parameters: dehaze={args.dehaze}, clahe={args.clahe}, saturation={args.saturation}, red_boost={args.red}")
     
-    # Process file based on extension
-    input_lower = args.input.lower()
-    if input_lower.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
-        processor.process_image(args.input, args.output)
-    elif input_lower.endswith(('.mp4', '.avi', '.mov', '.mkv')):
-        processor.process_video(args.input, args.output, fps=args.fps, num_workers=args.workers)
+    # Process based on input type
+    if os.path.isdir(args.input) or args.batch:
+        # Process as batch
+        logger.info(f"Processing folder: {args.input}")
+        processor.process_batch(args.input, args.output, fps=args.fps, num_workers=args.workers)
     else:
-        logger.error(f"Unsupported file format: {args.input}")
-        return 1
+        # Process single file
+        input_lower = args.input.lower()
+        if input_lower.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
+            processor.process_image(args.input, args.output)
+        elif input_lower.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+            processor.process_video(args.input, args.output, fps=args.fps, num_workers=args.workers)
+        else:
+            logger.error(f"Unsupported file format: {args.input}")
+            return 1
         
     logger.info("Processing completed successfully")
     return 0
