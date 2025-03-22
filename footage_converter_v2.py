@@ -11,6 +11,10 @@ from PIL import Image
 from tqdm import tqdm
 import logging
 import time
+import multiprocessing
+import signal
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
 logging.basicConfig(
@@ -20,10 +24,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger('UnderwaterConverter')
 
+# Global flag for graceful termination
+terminate_requested = False
+
+# Signal handler for graceful termination
+def signal_handler(sig, frame):
+    global terminate_requested
+    if terminate_requested:
+        logger.info("Forced termination requested. Exiting immediately.")
+        sys.exit(1)
+    else:
+        logger.info("Termination requested. Finishing current frame and cleaning up...")
+        logger.info("Press Ctrl+C again to force immediate exit.")
+        terminate_requested = True
+
+# Register signal handler
+signal.signal(signal.SIGINT, signal_handler)
+
 class UnderwaterImageProcessor:
     """Class for processing underwater images and videos to restore natural colors"""
     
-    def __init__(self, dehaze_strength=0.5, clahe_clip=3.0, saturation_boost=1.5, red_boost=1.15):
+    def __init__(self, dehaze_strength=0.5, clahe_clip=3.0, saturation_boost=1.5, red_boost=1.05):
         """
         Initialize the underwater image processor
         
@@ -60,8 +81,11 @@ class UnderwaterImageProcessor:
         l = self.clahe.apply(l)
         
         # Enhance the a channel (green-red) to restore lost reds
-        # Reduced from +30 to +15 for more natural look
-        a = cv2.add(a, 15)  # More subtle shift toward red
+        # Reduced from +15 to +10 for more natural look
+        a = cv2.add(a, 10)  # Subtle shift toward red
+        
+        # Enhance the b channel (blue-yellow) to balance colors
+        b = cv2.add(b, 5)   # Subtle shift toward yellow
         
         # Merge channels and convert back to BGR
         lab = cv2.merge((l, a, b))
@@ -177,7 +201,22 @@ class UnderwaterImageProcessor:
         elapsed_time = time.time() - start_time
         logger.info(f"Total processing time: {elapsed_time:.2f} seconds")
 
-    def process_video(self, input_path, output_path, fps=None):
+    def _process_frame(self, frame_path, output_frame_path):
+        """Process a single frame"""
+        # Check for termination request
+        if terminate_requested:
+            return False
+            
+        frame = cv2.imread(frame_path)
+        if frame is None:
+            logger.warning(f"Could not read frame: {frame_path}")
+            return False
+            
+        corrected = self.restore_color(frame)
+        cv2.imwrite(output_frame_path, corrected)
+        return True
+
+    def process_video(self, input_path, output_path, fps=None, num_workers=None):
         """
         Process a video file
         
@@ -185,12 +224,20 @@ class UnderwaterImageProcessor:
             input_path: Path to input video
             output_path: Path to save processed video
             fps: Frames per second (if None, detect from source)
+            num_workers: Number of parallel workers (defaults to CPU count)
         """
         start_time = time.time()
         logger.info(f"Starting video processing for: {input_path}")
+        logger.info("Press Ctrl+C at any time to gracefully cancel processing")
+        
+        if num_workers is None:
+            num_workers = multiprocessing.cpu_count()
+        
+        logger.info(f"Using {num_workers} parallel workers for frame processing")
         
         # Create temporary directory for frames
-        with tempfile.TemporaryDirectory() as temp_dir:
+        temp_dir = tempfile.mkdtemp()
+        try:
             # Get video properties
             cap = cv2.VideoCapture(input_path)
             if not cap.isOpened():
@@ -211,20 +258,63 @@ class UnderwaterImageProcessor:
             # Extract frames using ffmpeg (more efficient than OpenCV for extraction)
             logger.info("Extracting frames with ffmpeg...")
             frames_path = os.path.join(temp_dir, "frame_%04d.jpg")
+            # Use high-quality extraction for better results
             subprocess.run([
-                'ffmpeg', '-i', input_path, '-qscale:v', '2', frames_path
+                'ffmpeg', '-i', input_path, '-qscale:v', '2', 
+                # Use multiple threads for extraction
+                '-threads', str(num_workers),
+                frames_path
             ], check=True, capture_output=True)
             
-            # Process frames
+            # Process frames in parallel
             frame_files = sorted([f for f in os.listdir(temp_dir) if f.startswith("frame_")])
             
-            logger.info(f"Processing {len(frame_files)} frames...")
-            for i, filename in enumerate(tqdm(frame_files)):
-                frame_path = os.path.join(temp_dir, filename)
-                output_frame_path = os.path.join(temp_dir, f"corrected_{i+1:04d}.jpg")
-                frame = cv2.imread(frame_path)
-                corrected = self.restore_color(frame)
-                cv2.imwrite(output_frame_path, corrected)
+            logger.info(f"Processing {len(frame_files)} frames with {num_workers} workers...")
+            
+            # Process frames in parallel using ThreadPoolExecutor
+            completed_frames = 0
+            futures = []
+            
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all frame processing tasks
+                for i, filename in enumerate(frame_files):
+                    if terminate_requested:
+                        break
+                        
+                    futures.append((
+                        executor.submit(
+                            self._process_frame,
+                            os.path.join(temp_dir, filename),
+                            os.path.join(temp_dir, f"corrected_{i+1:04d}.jpg")
+                        ),
+                        i,
+                        filename
+                    ))
+                
+                # Process results as they complete
+                progress_bar = tqdm(total=len(futures))
+                for future, i, filename in [(f[0], f[1], f[2]) for f in futures]:
+                    if future.done() or future.running():
+                        try:
+                            success = future.result()
+                            if success:
+                                completed_frames += 1
+                            else:
+                                logger.warning(f"Failed to process frame {i+1}")
+                        except Exception as e:
+                            logger.error(f"Error processing frame {i+1}: {e}")
+                            
+                        progress_bar.update(1)
+                        
+                    if terminate_requested:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                
+                progress_bar.close()
+            
+            if terminate_requested:
+                logger.info(f"Processing cancelled. {completed_frames} frames were processed.")
+                return
                 
             # Rebuild video with ffmpeg, preserving metadata and orientation
             logger.info("Rebuilding video with ffmpeg...")
@@ -235,8 +325,11 @@ class UnderwaterImageProcessor:
             subprocess.run([
                 'ffmpeg', '-r', str(fps), 
                 '-i', os.path.join(temp_dir, "corrected_%04d.jpg"),
-                '-c:v', 'libx264', '-preset', 'slow', '-crf', '18',
+                # Use optimized encoding settings
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
                 '-pix_fmt', 'yuv420p',
+                # Use multiple threads for encoding
+                '-threads', str(num_workers),
                 # Add these options to maintain original orientation and size
                 '-vf', f'scale={width}:{height}',
                 temp_output
@@ -254,10 +347,15 @@ class UnderwaterImageProcessor:
                 '-c', 'copy',
                 output_path
             ], check=True, capture_output=True)
-        
-        elapsed_time = time.time() - start_time
-        logger.info(f"Saved corrected video: {output_path}")
-        logger.info(f"Total processing time: {elapsed_time:.2f} seconds")
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"Saved corrected video: {output_path}")
+            logger.info(f"Total processing time: {elapsed_time:.2f} seconds")
+        finally:
+            # Clean up temporary directory even if processing is cancelled
+            if os.path.exists(temp_dir):
+                logger.info("Cleaning up temporary files...")
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
 def main():
     parser = argparse.ArgumentParser(description="Enhance underwater images and videos by restoring natural colors.")
@@ -266,9 +364,11 @@ def main():
     parser.add_argument("--dehaze", "-d", type=float, default=0.5, help="Strength of dehazing effect (0.0-1.0)")
     parser.add_argument("--clahe", "-c", type=float, default=3.0, help="CLAHE clip limit for contrast enhancement")
     parser.add_argument("--saturation", "-s", type=float, default=1.5, help="Saturation boost factor")
-    parser.add_argument("--red", "-r", type=float, default=1.15, help="Red channel boost factor (1.0 = neutral, higher = more red)")
+    parser.add_argument("--red", "-r", type=float, default=1.05, help="Red channel boost factor (1.0 = neutral, higher = more red)")
     parser.add_argument("--fps", type=float, help="Output frames per second (default: same as input)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+    parser.add_argument("--workers", "-w", type=int, help="Number of worker threads for parallel processing (default: CPU count)")
+    parser.add_argument("--fast", "-f", action="store_true", help="Use faster processing with slightly lower quality")
     
     args = parser.parse_args()
     
@@ -286,6 +386,12 @@ def main():
     
     logger.info(f"Output file: {args.output}")
     
+    # Adjust parameters for fast mode
+    if args.fast:
+        logger.info("Using fast mode with optimized parameters")
+        # In fast mode, reduce dehaze strength and use lower quality ffmpeg settings
+        args.dehaze = min(args.dehaze, 0.3)  # Lower dehaze is faster
+    
     # Initialize processor
     processor = UnderwaterImageProcessor(
         dehaze_strength=args.dehaze,
@@ -301,7 +407,7 @@ def main():
     if input_lower.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
         processor.process_image(args.input, args.output)
     elif input_lower.endswith(('.mp4', '.avi', '.mov', '.mkv')):
-        processor.process_video(args.input, args.output, fps=args.fps)
+        processor.process_video(args.input, args.output, fps=args.fps, num_workers=args.workers)
     else:
         logger.error(f"Unsupported file format: {args.input}")
         return 1
