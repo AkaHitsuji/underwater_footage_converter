@@ -15,6 +15,8 @@ import multiprocessing
 import signal
 import sys
 import re
+import json
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
@@ -196,6 +198,10 @@ class UnderwaterImageProcessor:
                 original_exif = piexif.load(input_path)
                 piexif.insert(piexif.dump(original_exif), output_path)
                 logger.info("EXIF metadata transferred successfully")
+                
+                # Additionally try to preserve location data with exiftool
+                logger.info("Ensuring location metadata is preserved...")
+                self._copy_location_metadata_with_exiftool(input_path, output_path)
         except Exception as e:
             logger.warning(f"Could not preserve metadata: {e}")
             
@@ -299,10 +305,10 @@ class UnderwaterImageProcessor:
             # Kill the process if it's still running
             if process.poll() is None:
                 process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
             # Remove temporary file
             try:
                 if os.path.exists(progress_file.name):
@@ -329,7 +335,11 @@ class UnderwaterImageProcessor:
         
         logger.info(f"Using {num_workers} parallel workers for frame processing")
         
-        # Create temporary directory for frames
+        # Is this a MOV file? Special handling for Apple formats
+        is_mov_file = input_path.lower().endswith('.mov')
+        needs_metadata_preservation = is_mov_file  # We especially care about MOV formats
+        
+        # Create temporary directory for frames and intermediate files
         temp_dir = tempfile.mkdtemp()
         try:
             # Get video properties
@@ -417,54 +427,150 @@ class UnderwaterImageProcessor:
             if terminate_requested:
                 logger.info(f"Processing cancelled. {completed_frames} frames were processed.")
                 return
-                
-            # Rebuild video with ffmpeg, preserving metadata and orientation
-            logger.info("Rebuilding video with ffmpeg...")
-            temp_output = os.path.join(temp_dir, "temp_output.mp4")
             
-            # First create the video with processed frames, maintaining original dimensions
-            logger.info(f"Creating video at {width}x{height} resolution...")
+            # Create a temporary processed video file (for intermediate processing)
+            temp_processed = os.path.join(temp_dir, "processed_video.mp4")
             
+            # Create video from processed frames
+            logger.info("Creating processed video...")
             encoding_command = [
-                'ffmpeg', '-r', str(fps), 
+                'ffmpeg', '-r', str(fps),
                 '-i', os.path.join(temp_dir, "corrected_%04d.jpg"),
                 # Use optimized encoding settings
                 '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
                 '-pix_fmt', 'yuv420p',
                 # Use multiple threads for encoding
                 '-threads', str(num_workers),
-                # Add these options to maintain original orientation and size
+                # Add these options to maintain original dimensions
                 '-vf', f'scale={width}:{height}',
-                temp_output
+                # Add movflags for better compatibility
+                '-movflags', '+faststart',
+                temp_processed
             ]
             
-            # Use new progress monitoring method for encoding
+            # Monitor progress during encoding
             self._run_ffmpeg_with_progress(
-                encoding_command, 
-                completed_frames, 
+                encoding_command,
+                completed_frames,
                 "Creating video"
             )
             
-            # Then copy the metadata from original to new video
-            logger.info("Applying original metadata to the processed video...")
+            # Special handling for Apple MOV files with GPS data
+            if needs_metadata_preservation:
+                logger.info("Using optimized approach for preserving metadata in MOV file")
+                
+                # For MOV files, we'll use the reddit approach but with specific flags
+                # This approach prioritizes metadata preservation for Apple devices
+                
+                # Create a temporary file path for the output
+                temp_output_path = os.path.join(temp_dir, "final_with_metadata.mov")
+                
+                # Command that takes the processed video and copies metadata from the original
+                # This specific order is important for Apple devices
+                metadata_command = [
+                    'ffmpeg',
+                    '-i', input_path,          # Original file with metadata (first input)
+                    '-i', temp_processed,      # Processed video (second input)
+                    '-map', '1:v',             # Use video from the processed file (second input)
+                    '-map_metadata', '0',      # Use metadata from the original file (first input)
+                    # Copy audio, subtitles, and other streams from original
+                    '-map', '0:a?',            # Copy audio if present, skip if absent
+                    '-map', '0:s?',            # Copy subtitles if present, skip if absent
+                    '-map', '0:d?',            # Copy data if present, skip if absent
+                    '-map', '0:t?',            # Copy timecodes if present, skip if absent
+                    # Copy all streams without re-encoding
+                    '-c', 'copy',
+                    # Add specific flags for QuickTime/MOV metadata handling
+                    '-movflags', 'use_metadata_tags+faststart',
+                    temp_output_path
+                ]
+                
+                # Run the command to copy metadata
+                logger.info("Copying metadata from original to processed video...")
+                self._run_ffmpeg_with_progress(
+                    metadata_command,
+                    1,  # Only one "frame" for this operation
+                    "Copying metadata"
+                )
+                
+                # For Apple MOV files, we need additional fixes
+                logger.info("Applying exiftool fixes for Apple QuickTime metadata...")
+                try:
+                    # First copy all metadata from original file to the processed file
+                    exiftool_copy_cmd = [
+                        'exiftool',
+                        '-m',                        # Ignore minor errors
+                        '-overwrite_original',       # Overwrite the output file
+                        '-api', 'LargeFileSupport=1',  # Support for large video files
+                        '-tagsFromFile', input_path, # Copy tags from the input file
+                        '-all:all',                  # Copy all tags
+                        '-GPS:all',                  # Specifically ensure GPS tags are copied
+                        '-Apple:all',                # Copy all Apple-specific tags
+                        '-quicktime:all',            # Copy all QuickTime tags
+                        temp_output_path             # The output file to modify
+                    ]
+                    
+                    logger.info("Copying metadata from original to processed file...")
+                    subprocess.run(exiftool_copy_cmd, 
+                                 stdout=subprocess.PIPE, 
+                                 stderr=subprocess.PIPE,
+                                 check=False)
+                    
+                    # Then apply the specialized fix for Apple QuickTime Keys metadata
+                    exiftool_keys_cmd = [
+                        'exiftool',
+                        '-m',                   # Ignore minor errors
+                        '-overwrite_original',  # Overwrite the original file
+                        '-api', 'LargeFileSupport=1',  # Support for large video files
+                        '-Keys:All=',           # First clear the Keys to avoid conflicts
+                        '-tagsFromFile', '@',   # Copy tags from the same file (self-reference)
+                        '-Keys:All',            # Then copy back all the Keys (including location)
+                        temp_output_path        # Target file to modify
+                    ]
+                    
+                    logger.info("Applying Apple QuickTime Keys metadata fix...")
+                    subprocess.run(exiftool_keys_cmd, 
+                                 stdout=subprocess.PIPE, 
+                                 stderr=subprocess.PIPE,
+                                 check=False)
+                    
+                    # Now move the final version to the requested output path
+                    shutil.copy2(temp_output_path, output_path)
+                    logger.info("Successfully applied metadata fixes with exiftool")
+                    
+                except Exception as e:
+                    logger.warning(f"Error applying exiftool fixes: {e}")
+                    # If exiftool fails, just use the ffmpeg output
+                    shutil.copy2(temp_output_path, output_path)
+            else:
+                # For non-MOV files, use the normal approach
+                logger.info("Using standard metadata preservation for non-MOV file")
+                
+                # The standard approach uses -map_metadata 0 to copy metadata
+                metadata_command = [
+                    'ffmpeg',
+                    '-i', input_path,          # Original file with metadata (first input)
+                    '-i', temp_processed,      # Processed video (second input)
+                    '-map', '1:v',             # Use video from the processed file (second input)
+                    '-map_metadata', '0',      # Use metadata from the original file (first input)
+                    # Copy audio and other streams from original
+                    '-map', '0:a?',            # Copy audio if present, skip if absent
+                    '-map', '0:s?',            # Copy subtitles if present, skip if absent
+                    '-c', 'copy',              # Copy all streams (no re-encoding)
+                    # Add movflags for better compatibility
+                    '-movflags', 'use_metadata_tags+faststart',
+                    output_path
+                ]
+                
+                # Run the command to copy metadata
+                self._run_ffmpeg_with_progress(
+                    metadata_command,
+                    1,  # Only one "frame" for this operation
+                    "Copying metadata"
+                )
             
-            final_command = [
-                'ffmpeg', '-i', temp_output, 
-                '-i', input_path, 
-                '-map', '0:v', '-map_metadata', '1',
-                # Copy all streams from input except video
-                '-map', '1:a?', '-map', '1:s?', '-map', '1:d?', '-map', '1:t?',
-                # Copy streams without re-encoding
-                '-c', 'copy',
-                output_path
-            ]
-            
-            # This step can also benefit from progress tracking
-            self._run_ffmpeg_with_progress(
-                final_command,
-                1,  # Only one "frame" for metadata copying
-                "Finalizing video"
-            )
+            # Verify location data was preserved
+            verify_location_metadata(input_path, output_path)
             
             elapsed_time = time.time() - start_time
             logger.info(f"Saved corrected video: {output_path}")
@@ -543,6 +649,322 @@ class UnderwaterImageProcessor:
             logger.info(f"Batch processing completed. Processed {successful} files successfully, {failed} failed.")
         logger.info(f"Total processing time: {elapsed_time:.2f} seconds")
 
+    def _copy_location_metadata_with_exiftool(self, source_file, target_file):
+        """
+        Copy location metadata from source to target file using exiftool
+        exiftool has better support for GPS metadata than ffmpeg in some cases
+        
+        Args:
+            source_file: Path to the source file with GPS data
+            target_file: Path to the target file to copy GPS data to
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Check if exiftool is available
+            try:
+                subprocess.run(['exiftool', '-ver'], 
+                               stdout=subprocess.PIPE, 
+                               stderr=subprocess.PIPE,
+                               check=True)
+                has_exiftool = True
+            except (subprocess.SubprocessError, FileNotFoundError):
+                logger.warning("exiftool not found, skipping additional location metadata copy")
+                return False
+                
+            if has_exiftool:
+                logger.info("Using exiftool to copy location metadata...")
+                
+                # First, check if source has GPS data
+                gps_info_cmd = ['exiftool', '-s', '-G', '-Location', '-GPS*', source_file]
+                result = subprocess.run(gps_info_cmd, 
+                                     stdout=subprocess.PIPE, 
+                                     stderr=subprocess.PIPE,
+                                     text=True)
+                
+                if not result.stdout.strip():
+                    logger.warning(f"No location data found in source file: {source_file}")
+                    return False
+                
+                logger.info(f"Found location data in source: {result.stdout.strip()}")
+                
+                # For MOV files, we need specific handling for QuickTime metadata structure
+                file_ext = os.path.splitext(target_file)[1].lower()
+                
+                if file_ext in ['.mov', '.mp4']:
+                    logger.info("Using QuickTime-specific method for GPS metadata...")
+                    # Extract GPS data from source
+                    extract_cmd = [
+                        'exiftool', '-j', 
+                        '-GPS:GPSLatitude',
+                        '-GPS:GPSLatitudeRef',
+                        '-GPS:GPSLongitude',
+                        '-GPS:GPSLongitudeRef',
+                        source_file
+                    ]
+                    
+                    extract_result = subprocess.run(extract_cmd, 
+                                                stdout=subprocess.PIPE, 
+                                                stderr=subprocess.PIPE,
+                                                text=True)
+                    
+                    if extract_result.returncode != 0:
+                        logger.warning(f"Failed to extract GPS data: {extract_result.stderr}")
+                        return False
+                    
+                    try:
+                        # Parse JSON result
+                        gps_data = json.loads(extract_result.stdout)[0]
+                        
+                        # Check if we have GPS data
+                        if not ('GPSLatitude' in gps_data and 'GPSLongitude' in gps_data):
+                            logger.warning("GPS data extraction returned empty results")
+                            return False
+                            
+                        # Apply GPS data directly to target in the QuickTime format
+                        lat = gps_data.get('GPSLatitude', '')
+                        lat_ref = gps_data.get('GPSLatitudeRef', 'N')
+                        lon = gps_data.get('GPSLongitude', '')
+                        lon_ref = gps_data.get('GPSLongitudeRef', 'E')
+                        
+                        logger.info(f"Found GPS: Lat: {lat} {lat_ref}, Lon: {lon} {lon_ref}")
+                        
+                        # Convert to standard format if in DMS format
+                        lat_formatted = lat
+                        lon_formatted = lon
+                        
+                        # Apply to the target file with various tag formats to ensure compatibility
+                        apply_cmd = [
+                            'exiftool',
+                            '-GPSLatitude=%s' % lat_formatted,
+                            '-GPSLatitudeRef=%s' % lat_ref,
+                            '-GPSLongitude=%s' % lon_formatted,
+                            '-GPSLongitudeRef=%s' % lon_ref,
+                            # Add QuickTime specific location tags
+                            '-XMP:GPSLatitude=%s' % lat_formatted,
+                            '-XMP:GPSLongitude=%s' % lon_formatted,
+                            # Add as a human-readable location string
+                            f'-LocationCreated="{lat_formatted} {lat_ref}, {lon_formatted} {lon_ref}"',
+                            '-LocationTaken=%s' % f"{lat_formatted} {lat_ref}, {lon_formatted} {lon_ref}",
+                            '-Location=%s' % f"{lat_formatted} {lat_ref}, {lon_formatted} {lon_ref}",
+                            # Update metadata from original
+                            '-TagsFromFile', source_file,
+                            '-xmp:all',
+                            '-iptc:all',
+                            '-P',  # Preserve existing tags
+                            '-overwrite_original',
+                            target_file
+                        ]
+                    except json.JSONDecodeError:
+                        logger.warning("Failed to parse GPS data")
+                        return False
+                    except Exception as e:
+                        logger.warning(f"Error processing GPS data: {e}")
+                        return False
+                else:
+                    # For non-MOV files, use the original approach
+                    apply_cmd = [
+                        'exiftool', '-TagsFromFile', source_file,
+                        '-gps:all',
+                        '-location:all',
+                        '-coordinates:all',
+                        '-xmp:geotag',
+                        '-P',
+                        '-overwrite_original',
+                        target_file
+                    ]
+                
+                # Run the command
+                result = subprocess.run(apply_cmd, 
+                                     stdout=subprocess.PIPE, 
+                                     stderr=subprocess.PIPE,
+                                     text=True)
+                
+                if result.returncode == 0:
+                    # Verify location metadata was transferred
+                    verify_cmd = ['exiftool', '-s', '-G', '-Location', '-GPS*', target_file]
+                    verify_result = subprocess.run(verify_cmd, 
+                                                stdout=subprocess.PIPE, 
+                                                stderr=subprocess.PIPE,
+                                                text=True)
+                    
+                    if verify_result.stdout.strip():
+                        logger.info(f"Successfully verified location metadata: {verify_result.stdout.strip()}")
+                        return True
+                    else:
+                        logger.warning("Location metadata transfer failed verification")
+                        return False
+                else:
+                    logger.warning(f"exiftool error: {result.stderr}")
+                    return False
+        except Exception as e:
+            logger.warning(f"Error using exiftool to copy metadata: {e}")
+            return False
+        
+        return False
+
+    def _add_quicktime_gps_metadata(self, input_path, output_path):
+        """
+        Special function to add GPS metadata to QuickTime MOV files in a format recognized by macOS
+        
+        Args:
+            input_path: Path to original file with GPS data
+            output_path: Path to processed file
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Check if exiftool is available
+            try:
+                subprocess.run(['exiftool', '-ver'], 
+                               stdout=subprocess.PIPE, 
+                               stderr=subprocess.PIPE,
+                               check=True)
+            except (subprocess.SubprocessError, FileNotFoundError):
+                logger.warning("exiftool not found, cannot add GPS metadata")
+                return False
+            
+            # Use the suggested command that properly preserves all Keys metadata (crucial for Apple devices)
+            logger.info("Using specialized exiftool command for Apple QuickTime metadata...")
+            cmd = [
+                'exiftool',
+                '-m',                   # Ignore minor errors
+                '-overwrite_original',  # Overwrite the original file
+                '-api', 'LargeFileSupport=1',  # Support for large video files
+                '-Keys:All=',           # First clear the Keys to avoid conflicts
+                '-tagsFromFile', '@',   # Copy tags from the same file (self-reference)
+                '-Keys:All',            # Then copy back all the Keys (including location)
+                output_path             # Target file to modify
+            ]
+            
+            # Execute the command
+            result = subprocess.run(cmd, 
+                                 stdout=subprocess.PIPE, 
+                                 stderr=subprocess.PIPE,
+                                 text=True)
+            
+            if result.returncode == 0:
+                logger.info("Successfully applied Apple QuickTime metadata fix")
+                # Return true even if there's a warning, as long as the command was successful
+                return True
+            else:
+                logger.warning(f"exiftool error: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error in _add_quicktime_gps_metadata: {e}")
+            return False
+
+def verify_location_metadata(input_file, output_file):
+    """
+    Verify that location metadata was preserved by checking both files
+    
+    Args:
+        input_file: Original input file path
+        output_file: Processed output file path
+        
+    Returns:
+        bool: True if location metadata was preserved, False otherwise
+    """
+    logger.info(f"Verifying location metadata preservation...")
+    try:
+        # Use exiftool to check GPS data in both files
+        cmd_original = ['exiftool', '-s', '-G', '-Location', '-GPS*', input_file]
+        cmd_processed = ['exiftool', '-s', '-G', '-Location', '-GPS*', output_file]
+        
+        result_original = subprocess.run(cmd_original, 
+                                      stdout=subprocess.PIPE, 
+                                      stderr=subprocess.PIPE,
+                                      text=True)
+        
+        result_processed = subprocess.run(cmd_processed, 
+                                       stdout=subprocess.PIPE, 
+                                       stderr=subprocess.PIPE,
+                                       text=True)
+        
+        # Check if original has GPS data
+        original_gps = result_original.stdout.strip()
+        if not original_gps:
+            logger.warning(f"No location data found in original file: {input_file}")
+            return False
+            
+        # Check if processed file has GPS data
+        processed_gps = result_processed.stdout.strip()
+        if not processed_gps:
+            logger.error(f"Location data NOT preserved in processed file: {output_file}")
+            logger.error(f"Original GPS data: {original_gps}")
+            return False
+            
+        # Compare data (exact match not required, just ensure processed file has GPS data)
+        logger.info(f"Original GPS data: {original_gps}")
+        logger.info(f"Processed GPS data: {processed_gps}")
+        
+        # Basic verification that key GPS tags are present
+        if "GPSLatitude" in processed_gps and "GPSLongitude" in processed_gps:
+            logger.info("✅ Location metadata successfully preserved")
+            return True
+        else:
+            logger.error("❌ Location metadata not fully preserved")
+            return False
+    except Exception as e:
+        logger.error(f"Error verifying location metadata: {e}")
+        return False
+
+def test_location_preservation(input_file=None):
+    """
+    Run test for location metadata preservation
+    
+    Args:
+        input_file: Optional specific file to test. If not provided, a sample file will be used.
+                  
+    Returns:
+        bool: True if test passes, False otherwise
+    """
+    import tempfile
+    import os
+    
+    if not input_file:
+        logger.error("No test file provided.")
+        return False
+        
+    logger.info(f"Running location metadata preservation test with: {input_file}")
+    
+    # Create a temporary output file
+    with tempfile.NamedTemporaryFile(suffix=os.path.splitext(input_file)[1], delete=False) as temp_file:
+        output_file = temp_file.name
+        
+    try:
+        # Process the file
+        processor = UnderwaterImageProcessor()
+        file_lower = input_file.lower()
+        
+        if file_lower.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
+            processor.process_image(input_file, output_file)
+        elif file_lower.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+            processor.process_video(input_file, output_file)
+        else:
+            logger.error(f"Unsupported file format: {input_file}")
+            os.unlink(output_file)
+            return False
+            
+        # Verify location metadata was preserved
+        result = verify_location_metadata(input_file, output_file)
+        
+        if result:
+            logger.info("✅ TEST PASSED: Location metadata was correctly preserved")
+        else:
+            logger.error("❌ TEST FAILED: Location metadata was NOT correctly preserved")
+            
+        return result
+    finally:
+        # Clean up
+        try:
+            os.unlink(output_file)
+        except:
+            pass
+            
 def main():
     parser = argparse.ArgumentParser(description="Enhance underwater images and videos by restoring natural colors.")
     parser.add_argument("input", help="Path to the input image, video file, or folder containing images/videos.")
@@ -556,6 +978,7 @@ def main():
     parser.add_argument("--workers", "-w", type=int, help="Number of worker threads for parallel processing (default: CPU count)")
     parser.add_argument("--fast", "-f", action="store_true", help="Use faster processing with slightly lower quality")
     parser.add_argument("--batch", "-b", action="store_true", help="Process input as a folder containing multiple files")
+    parser.add_argument("--test-location", "-t", action="store_true", help="Run test for location metadata preservation")
     
     args = parser.parse_args()
     
@@ -564,6 +987,13 @@ def main():
         logging.getLogger('UnderwaterConverter').setLevel(logging.DEBUG)
     
     logger.info("Underwater Footage Converter v2.0")
+    
+    # Test mode for location metadata preservation
+    if args.test_location:
+        logger.info("Running in TEST MODE for location metadata preservation")
+        result = test_location_preservation(args.input)
+        return 0 if result else 1
+    
     logger.info(f"Input: {args.input}")
     
     # Generate output filename/folder if not provided

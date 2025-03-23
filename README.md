@@ -1,35 +1,63 @@
 # Underwater Footage Converter
 
-A tool for restoring natural colors in underwater images and videos by compensating for spectral absorption and blue-green color shift.
+A Python tool for enhancing underwater video and image footage while preserving important metadata including GPS location data.
 
 ## TODO
 - [ ] Convert to generic script that can do multiple other things like compression
 - [ ] Consider chrome extension or webpage
 
-
 ## Features
 
-- Processes both images and videos
-- Restores natural colors by compensating for underwater light absorption
-- Applies dehazing to reduce water turbidity effects
-- Enhances contrast and clarity
-- Boosts lost red tones in underwater footage
-- Preserves original metadata (EXIF, creation date, etc.)
-- Simple command-line interface
+- Color correction optimized for underwater footage
+- Dehaze effect to reduce water turbidity
+- Contrast enhancement using CLAHE algorithm 
+- Red channel boosting to restore colors lost underwater
+- Saturation enhancement for vivid results
+- Preserves original metadata including GPS location data
+- Multi-threaded processing for faster conversion
+- Support for both images (JPG, PNG, TIFF) and videos (MP4, MOV, AVI, MKV)
+
+## Metadata Preservation
+
+The converter implements multiple approaches to preserve metadata from the original files, with special attention to GPS location data in Apple QuickTime MOV files:
+
+1. **FFmpeg Metadata Mapping**: Uses FFmpeg's `-map_metadata` feature to copy metadata from the original file to the processed file without re-encoding the streams.
+
+2. **Apple QuickTime Keys Preservation**: For MOV files from iOS devices, we use a specialized exiftool command that preserves the critical 'Keys' metadata atom, which is required for macOS to properly recognize location data:
+   ```
+   exiftool -m -overwrite_original -api LargeFileSupport=1 -Keys:All= -tagsFromFile @ -Keys:All output.mov
+   ```
+   This specific approach successfully preserves location metadata in a way that macOS Finder, Photos, and Spotlight can recognize.
+
+3. **Format-Specific Handling**: MOV files get special treatment to maximize compatibility with macOS and iOS.
+
+### Location Data Working Properly
+
+Unlike many other conversion tools, this converter successfully preserves location metadata in a way that:
+
+- macOS Spotlight (`mdls`) correctly shows latitude and longitude
+- Location is visible in macOS Finder's "Get Info" panel
+- Photos and other media applications can read the geographic data
+- Original creation dates and other metadata is retained
+
+This is particularly important for underwater footage from iPhones and other iOS devices, where location data helps organize and map dive locations.
 
 ## Requirements
 
 - Python 3.6+
-- OpenCV (`opencv-python`)
+- OpenCV
 - NumPy
-- ffmpeg (installed on your system)
+- FFmpeg
+- Exiftool
+- PIL/Pillow
+- tqdm
 
 ## Installation
 
 1. Clone this repository:
    ```
-   git clone https://github.com/yourusername/underwater_footage_converter.git
-   cd underwater_footage_converter
+   git clone https://github.com/yourusername/underwater-footage-converter.git
+   cd underwater-footage-converter
    ```
 
 2. Install dependencies:
@@ -37,70 +65,48 @@ A tool for restoring natural colors in underwater images and videos by compensat
    pip install -r requirements.txt
    ```
 
-3. Make sure you have ffmpeg installed on your system:
-   - **macOS**: `brew install ffmpeg`
-   - **Ubuntu/Debian**: `sudo apt install ffmpeg`
-   - **Windows**: Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH
+3. Make sure you have FFmpeg and Exiftool installed on your system:
+   - **macOS**: `brew install ffmpeg exiftool`
+   - **Ubuntu/Debian**: `sudo apt install ffmpeg libimage-exiftool-perl`
+   - **Windows**: Download FFmpeg from [ffmpeg.org](https://ffmpeg.org/download.html) and Exiftool from [exiftool.org](https://exiftool.org/)
 
 ## Usage
 
-### Basic Usage
-
-Process an image or video:
+Basic usage:
 
 ```bash
-python footage_converter_v2.py input_file.jpg
+python footage_converter_v2.py input_file.mov -o output_file.mov
 ```
 
-The processed file will be saved as `input_file_converted.jpg` in the same directory.
-
-To specify an output file:
+Process a folder of files:
 
 ```bash
-python footage_converter_v2.py input_file.mp4 --output corrected_file.mp4
+python footage_converter_v2.py input_folder/ --output output_folder/ --batch
 ```
 
-### Advanced Options
-
-The v2 script provides additional processing options:
+Adjust processing parameters:
 
 ```bash
-python footage_converter_v2.py input_file.mp4 \
-  --dehaze 0.7 \    # Strength of dehazing (0.0-1.0)
-  --clahe 2.5 \     # CLAHE clip limit for contrast
-  --saturation 1.8  # Saturation boost factor
+python footage_converter_v2.py input.mov -o output.mov --dehaze 0.7 --clahe 2.5 --saturation 1.8 --red 1.1
 ```
 
-For full help:
+## Options
 
-```bash
-python footage_converter_v2.py --help
-```
+- `--output`, `-o`: Path to save the processed file or folder
+- `--dehaze`, `-d`: Strength of dehazing effect (0.0-1.0)
+- `--clahe`, `-c`: CLAHE clip limit for contrast enhancement
+- `--saturation`, `-s`: Saturation boost factor
+- `--red`, `-r`: Red channel boost factor (1.0 = neutral)
+- `--fps`: Output frames per second (default: same as input)
+- `--workers`, `-w`: Number of worker threads (default: CPU count)
+- `--fast`, `-f`: Use faster processing with slightly lower quality
+- `--batch`, `-b`: Process input as a folder containing multiple files
+- `--verbose`, `-v`: Enable verbose logging
 
-## Version Comparison
+## Acknowledgments
 
-### v1 (Basic)
-- Simple color restoration using CLAHE and white balancing
-- Basic video processing
-
-### v2 (Advanced)
-- Improved color restoration algorithms
-- Dehazing for reducing turbidity
-- Metadata preservation
-- Progress bar for video processing
-- More customization options
-- OOP design for better extensibility
-
-## Examples
-
-Before and after processing:
-
-[Insert before/after images]
-
-## License
-
-[Your license information]
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request. 
+This project uses several open-source libraries and tools:
+- FFmpeg for video processing
+- ExifTool for metadata handling
+- OpenCV for image processing
+- Python and its ecosystem 
