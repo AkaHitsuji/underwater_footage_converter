@@ -102,15 +102,18 @@ class UnderwaterImageProcessor:
             frames_path
         ]
 
-    def _create_ffmpeg_encoding_command(self, frames_path, output_path, fps, width, height, num_workers):
+    def _create_ffmpeg_encoding_command(self, frames_path, output_path, fps, width, height, num_workers, crf=28):
         """Create FFmpeg command for encoding frames into video"""
         return [
             'ffmpeg', '-r', str(fps),
             '-i', frames_path,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-c:v', 'libx265',  # Use HEVC codec instead of H.264
+            '-preset', 'medium',  # Use medium preset (balance between speed and compression)
+            '-crf', str(crf),  # Higher CRF value (23-28 range for HEVC is visually lossless but smaller)
             '-pix_fmt', 'yuv420p',
             '-threads', str(num_workers),
             '-vf', f'scale={width}:{height}',
+            '-tag:v', 'hvc1',  # Ensure compatibility with Apple devices
             '-movflags', '+faststart',
             output_path
         ]
@@ -433,7 +436,7 @@ class UnderwaterImageProcessor:
             
         return False
 
-    def process_video(self, input_path, output_path, fps=None, num_workers=None):
+    def process_video(self, input_path, output_path, fps=None, num_workers=None, crf=28):
         """
         Process a video file
         
@@ -442,6 +445,7 @@ class UnderwaterImageProcessor:
             output_path: Path to save processed video
             fps: Frames per second (if None, detect from source)
             num_workers: Number of parallel workers (defaults to CPU count)
+            crf: Constant Rate Factor for video quality (lower = better quality, higher = smaller size)
         """
         start_time = time.time()
         logger.info(f"Starting video processing for: {input_path}")
@@ -499,7 +503,7 @@ class UnderwaterImageProcessor:
             logger.info("Creating processed video...")
             corrected_frames_path = os.path.join(temp_dir, "corrected_%04d.jpg")
             encoding_command = self._create_ffmpeg_encoding_command(
-                corrected_frames_path, temp_processed, fps, width, height, num_workers
+                corrected_frames_path, temp_processed, fps, width, height, num_workers, crf=crf
             )
             self._run_ffmpeg_with_progress(encoding_command, completed_frames, "Creating video")
             
@@ -609,7 +613,7 @@ class UnderwaterImageProcessor:
         # Verify location data was preserved
         verify_location_metadata(input_path, output_path)
 
-    def process_batch(self, input_folder, output_folder, fps=None, num_workers=None):
+    def process_batch(self, input_folder, output_folder, fps=None, num_workers=None, crf=28):
         """
         Process all supported files in a folder
         
@@ -618,6 +622,7 @@ class UnderwaterImageProcessor:
             output_folder: Path to save processed files
             fps: Frames per second for videos (if None, detect from source)
             num_workers: Number of parallel workers (defaults to CPU count)
+            crf: Constant Rate Factor for video quality (lower = better quality, higher = smaller size)
         """
         start_time = time.time()
         
@@ -661,7 +666,7 @@ class UnderwaterImageProcessor:
                     successful += 1
                 elif is_video_file(input_file):
                     logger.info(f"Processing video: {input_file}")
-                    self.process_video(input_file, output_file, fps=fps, num_workers=num_workers)
+                    self.process_video(input_file, output_file, fps=fps, num_workers=num_workers, crf=crf)
                     successful += 1
             except Exception as e:
                 logger.error(f"Error processing {input_file}: {e}")
@@ -928,6 +933,7 @@ def main():
     parser.add_argument("--fast", "-f", action="store_true", help="Use faster processing with slightly lower quality")
     parser.add_argument("--batch", "-b", action="store_true", help="Process input as a folder containing multiple files")
     parser.add_argument("--test-location", "-t", action="store_true", help="Run test for location metadata preservation")
+    parser.add_argument("--quality", "-q", type=int, default=28, help="Video quality (CRF value: 18-28 range, lower = higher quality and larger size)")
     
     args = parser.parse_args()
     
@@ -969,19 +975,19 @@ def main():
         red_boost=args.red
     )
     
-    logger.info(f"Processing parameters: dehaze={args.dehaze}, clahe={args.clahe}, saturation={args.saturation}, red_boost={args.red}")
+    logger.info(f"Processing parameters: dehaze={args.dehaze}, clahe={args.clahe}, saturation={args.saturation}, red_boost={args.red}, video quality={args.quality}")
     
     # Process based on input type
     if os.path.isdir(args.input) or args.batch:
         # Process as batch
         logger.info(f"Processing folder: {args.input}")
-        processor.process_batch(args.input, args.output, fps=args.fps, num_workers=args.workers)
+        processor.process_batch(args.input, args.output, fps=args.fps, num_workers=args.workers, crf=args.quality)
     else:
         # Process single file
         if is_image_file(args.input):
             processor.process_image(args.input, args.output)
         elif is_video_file(args.input):
-            processor.process_video(args.input, args.output, fps=args.fps, num_workers=args.workers)
+            processor.process_video(args.input, args.output, fps=args.fps, num_workers=args.workers, crf=args.quality)
         else:
             logger.error(f"Unsupported file format: {args.input}")
             return 1
