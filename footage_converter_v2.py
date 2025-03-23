@@ -19,6 +19,12 @@ import json
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Constants for file types
+IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.tif', '.tiff')
+VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv')
+SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
+QUICKTIME_EXTENSIONS = ('.mov', '.mp4')
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -44,6 +50,31 @@ def signal_handler(sig, frame):
 # Register signal handler
 signal.signal(signal.SIGINT, signal_handler)
 
+# Utility functions
+def is_image_file(file_path):
+    """Check if a file is a supported image format"""
+    return file_path.lower().endswith(IMAGE_EXTENSIONS)
+
+def is_video_file(file_path):
+    """Check if a file is a supported video format"""
+    return file_path.lower().endswith(VIDEO_EXTENSIONS)
+
+def is_quicktime_format(file_path):
+    """Check if a file is in a QuickTime format (MOV/MP4)"""
+    return file_path.lower().endswith(QUICKTIME_EXTENSIONS)
+
+def check_exiftool_available():
+    """Check if exiftool is available on the system"""
+    try:
+        subprocess.run(['exiftool', '-ver'], 
+                       stdout=subprocess.PIPE, 
+                       stderr=subprocess.PIPE,
+                       check=True)
+        return True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        logger.warning("exiftool not found, metadata preservation capabilities will be limited")
+        return False
+
 class UnderwaterImageProcessor:
     """Class for processing underwater images and videos to restore natural colors"""
     
@@ -63,6 +94,144 @@ class UnderwaterImageProcessor:
         self.red_boost = red_boost
         self.clahe = cv2.createCLAHE(clipLimit=self.clahe_clip, tileGridSize=(8, 8))
     
+    def _create_ffmpeg_extraction_command(self, input_path, frames_path, num_workers):
+        """Create FFmpeg command for extracting frames from video"""
+        return [
+            'ffmpeg', '-i', input_path, '-qscale:v', '2', 
+            '-threads', str(num_workers),
+            frames_path
+        ]
+
+    def _create_ffmpeg_encoding_command(self, frames_path, output_path, fps, width, height, num_workers):
+        """Create FFmpeg command for encoding frames into video"""
+        return [
+            'ffmpeg', '-r', str(fps),
+            '-i', frames_path,
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+            '-threads', str(num_workers),
+            '-vf', f'scale={width}:{height}',
+            '-movflags', '+faststart',
+            output_path
+        ]
+
+    def _create_ffmpeg_metadata_command(self, input_path, processed_path, output_path, is_quicktime=False):
+        """Create FFmpeg command for copying metadata from original to processed video"""
+        cmd = [
+            'ffmpeg',
+            '-i', input_path,          # Original file with metadata (first input)
+            '-i', processed_path,      # Processed video (second input)
+            '-map', '1:v',             # Use video from the processed file
+            '-map_metadata', '0',      # Use metadata from the original file
+            '-map', '0:a?',            # Copy audio if present
+            '-map', '0:s?',            # Copy subtitles if present
+            '-c', 'copy',              # Copy all streams (no re-encoding)
+            '-movflags', 'use_metadata_tags+faststart'
+        ]
+        
+        # Add QuickTime-specific mapping options if needed
+        if is_quicktime:
+            cmd.extend([
+                '-map', '0:d?',        # Copy data if present
+                '-map', '0:t?'         # Copy timecodes if present
+            ])
+        
+        cmd.append(output_path)
+        return cmd
+
+    def _run_ffmpeg_with_progress(self, command, total_frames, description="Processing"):
+        """Run FFmpeg command with progress monitoring"""
+        # Create a temporary file for FFmpeg progress
+        progress_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
+        progress_file.close()
+        
+        # Add progress monitoring to the command
+        full_command = command.copy()  # Create a copy to avoid modifying the original
+        
+        # Add stats and progress options
+        if '-y' not in full_command:
+            full_command = [full_command[0], '-y'] + full_command[1:]  # Add overwrite flag
+        full_command.extend(['-stats', '-progress', progress_file.name])
+        
+        # Start FFmpeg process
+        process = subprocess.Popen(
+            full_command, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE
+        )
+        
+        # Setup progress bar
+        pbar = tqdm(total=total_frames, desc=description)
+        
+        # Monitor progress
+        last_frame = 0
+        stalled_count = 0  # Counter to detect if progress is stuck
+        
+        try:
+            while process.poll() is None:
+                try:
+                    time.sleep(0.5)  # Check progress every half second
+                    
+                    if os.path.exists(progress_file.name) and os.path.getsize(progress_file.name) > 0:
+                        with open(progress_file.name, 'r') as f:
+                            progress_text = f.read()
+                        
+                        frame_match = re.search(r'frame=\s*(\d+)', progress_text)
+                        if frame_match:
+                            current_frame = int(frame_match.group(1))
+                            if current_frame > last_frame:
+                                pbar.update(current_frame - last_frame)
+                                last_frame = current_frame
+                                stalled_count = 0  # Reset stall counter
+                            else:
+                                stalled_count += 1
+                except (IOError, FileNotFoundError):
+                    pass  # File not ready yet
+                
+                # If progress appears stuck but process is still running,
+                # just update the progress bar a little to show activity
+                if stalled_count > 10 and last_frame < total_frames:  
+                    pbar.set_description(f"{description} (estimating...)")
+                    # Avoid updating beyond total
+                    if last_frame < total_frames - 1:
+                        pbar.update(1)
+                        last_frame += 1
+                    stalled_count = 0
+            
+            # Get the process result
+            stdout, stderr = process.communicate()
+            stderr_text = stderr.decode('utf-8', errors='ignore') if stderr else ""
+            
+            # Ensure progress bar reaches 100% when process completes successfully
+            if process.returncode == 0 and last_frame < total_frames:
+                pbar.update(total_frames - last_frame)
+            
+            # Check if process completed successfully
+            if process.returncode != 0:
+                logger.error(f"FFmpeg process failed with return code {process.returncode}")
+                logger.error(f"Error output: {stderr_text}")
+                raise subprocess.CalledProcessError(process.returncode, full_command, 
+                                                output=stdout, stderr=stderr)
+                
+            return process.returncode
+            
+        finally:
+            # Always clean up, even if there's an exception
+            pbar.close()
+            # Kill the process if it's still running
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            # Remove temporary file
+            try:
+                if os.path.exists(progress_file.name):
+                    os.unlink(progress_file.name)
+            except:
+                pass
+
     def restore_color(self, image):
         """
         Restore natural colors in underwater image
@@ -200,8 +369,7 @@ class UnderwaterImageProcessor:
                 logger.info("EXIF metadata transferred successfully")
                 
                 # Additionally try to preserve location data with exiftool
-                logger.info("Ensuring location metadata is preserved...")
-                self._copy_location_metadata_with_exiftool(input_path, output_path)
+                self._preserve_metadata(input_path, output_path)
         except Exception as e:
             logger.warning(f"Could not preserve metadata: {e}")
             
@@ -223,98 +391,47 @@ class UnderwaterImageProcessor:
         cv2.imwrite(output_frame_path, corrected)
         return True
 
-    def _run_ffmpeg_with_progress(self, command, total_frames, description="Processing"):
-        """Run FFmpeg command with progress monitoring"""
-        # Create a temporary file for FFmpeg progress
-        progress_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
-        progress_file.close()
+    def _preserve_metadata(self, source_file, target_file):
+        """Preserve metadata from source file to target file"""
+        logger.info("Ensuring all metadata is preserved...")
+
+        if not check_exiftool_available():
+            logger.warning("Cannot preserve metadata: exiftool not available")
+            return False
+            
+        # First, check if source has GPS data
+        gps_info_cmd = ['exiftool', '-s', '-G', '-Location', '-GPS*', source_file]
+        result = subprocess.run(gps_info_cmd, 
+                             stdout=subprocess.PIPE, 
+                             stderr=subprocess.PIPE,
+                             text=True)
         
-        # Add progress monitoring to the command
-        full_command = command.copy()  # Create a copy to avoid modifying the original
-        
-        # Add stats and progress options
-        if '-y' not in full_command:
-            full_command = [full_command[0], '-y'] + full_command[1:]  # Add overwrite flag
-        full_command.extend(['-stats', '-progress', progress_file.name])
-        
-        # Start FFmpeg process
-        process = subprocess.Popen(
-            full_command, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE
-        )
-        
-        # Setup progress bar
-        pbar = tqdm(total=total_frames, desc=description)
-        
-        # Monitor progress
-        last_frame = 0
-        stalled_count = 0  # Counter to detect if progress is stuck
-        
-        try:
-            while process.poll() is None:
-                try:
-                    time.sleep(0.5)  # Check progress every half second
+        if result.stdout.strip():
+            logger.info(f"Found location data in source: {result.stdout.strip()}")
+            
+            # Get appropriate exiftool command for this file type
+            cmd = get_exiftool_cmd_for_metadata_copy(source_file, target_file)
+            if cmd:
+                # Run the command
+                result = subprocess.run(cmd, 
+                                     stdout=subprocess.PIPE, 
+                                     stderr=subprocess.PIPE,
+                                     text=True)
+                
+                success = result.returncode == 0
+                if success:
+                    logger.info("Successfully preserved metadata")
                     
-                    if os.path.exists(progress_file.name) and os.path.getsize(progress_file.name) > 0:
-                        with open(progress_file.name, 'r') as f:
-                            progress_text = f.read()
-                        
-                        frame_match = re.search(r'frame=\s*(\d+)', progress_text)
-                        if frame_match:
-                            current_frame = int(frame_match.group(1))
-                            if current_frame > last_frame:
-                                pbar.update(current_frame - last_frame)
-                                last_frame = current_frame
-                                stalled_count = 0  # Reset stall counter
-                            else:
-                                stalled_count += 1
-                except (IOError, FileNotFoundError):
-                    pass  # File not ready yet
-                
-                # If progress appears stuck but process is still running,
-                # just update the progress bar a little to show activity
-                if stalled_count > 10 and last_frame < total_frames:  
-                    pbar.set_description(f"{description} (estimating...)")
-                    # Avoid updating beyond total
-                    if last_frame < total_frames - 1:
-                        pbar.update(1)
-                        last_frame += 1
-                    stalled_count = 0
+                    # Apply QuickTime-specific fix if needed
+                    if is_quicktime_format(target_file):
+                        fix_quicktime_metadata(target_file)
+                else:
+                    logger.warning(f"Error preserving metadata: {result.stderr}")
+                return success
+        else:
+            logger.warning(f"No location data found in source file: {source_file}")
             
-            # Get the process result
-            stdout, stderr = process.communicate()
-            stderr_text = stderr.decode('utf-8', errors='ignore') if stderr else ""
-            
-            # Ensure progress bar reaches 100% when process completes successfully
-            if process.returncode == 0 and last_frame < total_frames:
-                pbar.update(total_frames - last_frame)
-            
-            # Check if process completed successfully
-            if process.returncode != 0:
-                logger.error(f"FFmpeg process failed with return code {process.returncode}")
-                logger.error(f"Error output: {stderr_text}")
-                raise subprocess.CalledProcessError(process.returncode, full_command, 
-                                                   output=stdout, stderr=stderr)
-                
-            return process.returncode
-            
-        finally:
-            # Always clean up, even if there's an exception
-            pbar.close()
-            # Kill the process if it's still running
-            if process.poll() is None:
-                process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            # Remove temporary file
-            try:
-                if os.path.exists(progress_file.name):
-                    os.unlink(progress_file.name)
-            except:
-                pass
+        return False
 
     def process_video(self, input_path, output_path, fps=None, num_workers=None):
         """
@@ -335,9 +452,8 @@ class UnderwaterImageProcessor:
         
         logger.info(f"Using {num_workers} parallel workers for frame processing")
         
-        # Is this a MOV file? Special handling for Apple formats
-        is_mov_file = input_path.lower().endswith('.mov')
-        needs_metadata_preservation = is_mov_file  # We especially care about MOV formats
+        # Special handling for Apple formats (MOV)
+        is_quicktime = is_quicktime_format(input_path)
         
         # Create temporary directory for frames and intermediate files
         temp_dir = tempfile.mkdtemp()
@@ -359,227 +475,139 @@ class UnderwaterImageProcessor:
                 
             cap.release()
             
-            # Extract frames using ffmpeg (more efficient than OpenCV for extraction)
+            # Extract frames
             logger.info("Extracting frames with ffmpeg...")
             frames_path = os.path.join(temp_dir, "frame_%04d.jpg")
-            
-            # Use high-quality extraction for better results
-            extraction_command = [
-                'ffmpeg', '-i', input_path, '-qscale:v', '2', 
-                # Use multiple threads for extraction
-                '-threads', str(num_workers),
-                frames_path
-            ]
-            
-            # Use new progress monitoring method
-            self._run_ffmpeg_with_progress(
-                extraction_command, 
-                frame_count, 
-                "Extracting frames"
-            )
+            extraction_command = self._create_ffmpeg_extraction_command(input_path, frames_path, num_workers)
+            self._run_ffmpeg_with_progress(extraction_command, frame_count, "Extracting frames")
             
             # Process frames in parallel
             frame_files = sorted([f for f in os.listdir(temp_dir) if f.startswith("frame_")])
-            
             logger.info(f"Processing {len(frame_files)} frames with {num_workers} workers...")
             
             # Process frames in parallel using ThreadPoolExecutor
-            completed_frames = 0
-            futures = []
-            
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                # Submit all frame processing tasks
-                for i, filename in enumerate(frame_files):
-                    if terminate_requested:
-                        break
-                        
-                    futures.append((
-                        executor.submit(
-                            self._process_frame,
-                            os.path.join(temp_dir, filename),
-                            os.path.join(temp_dir, f"corrected_{i+1:04d}.jpg")
-                        ),
-                        i,
-                        filename
-                    ))
-                
-                # Process results as they complete
-                progress_bar = tqdm(total=len(futures), desc="Processing frames")
-                for future, i, filename in [(f[0], f[1], f[2]) for f in futures]:
-                    if future.done() or future.running():
-                        try:
-                            success = future.result()
-                            if success:
-                                completed_frames += 1
-                            else:
-                                logger.warning(f"Failed to process frame {i+1}")
-                        except Exception as e:
-                            logger.error(f"Error processing frame {i+1}: {e}")
-                            
-                        progress_bar.update(1)
-                        
-                    if terminate_requested:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        break
-                
-                progress_bar.close()
+            completed_frames = self._process_frames_parallel(temp_dir, frame_files, num_workers)
             
             if terminate_requested:
                 logger.info(f"Processing cancelled. {completed_frames} frames were processed.")
                 return
             
-            # Create a temporary processed video file (for intermediate processing)
+            # Create a temporary processed video file
             temp_processed = os.path.join(temp_dir, "processed_video.mp4")
             
             # Create video from processed frames
             logger.info("Creating processed video...")
-            encoding_command = [
-                'ffmpeg', '-r', str(fps),
-                '-i', os.path.join(temp_dir, "corrected_%04d.jpg"),
-                # Use optimized encoding settings
-                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-                '-pix_fmt', 'yuv420p',
-                # Use multiple threads for encoding
-                '-threads', str(num_workers),
-                # Add these options to maintain original dimensions
-                '-vf', f'scale={width}:{height}',
-                # Add movflags for better compatibility
-                '-movflags', '+faststart',
-                temp_processed
-            ]
-            
-            # Monitor progress during encoding
-            self._run_ffmpeg_with_progress(
-                encoding_command,
-                completed_frames,
-                "Creating video"
+            corrected_frames_path = os.path.join(temp_dir, "corrected_%04d.jpg")
+            encoding_command = self._create_ffmpeg_encoding_command(
+                corrected_frames_path, temp_processed, fps, width, height, num_workers
             )
+            self._run_ffmpeg_with_progress(encoding_command, completed_frames, "Creating video")
             
-            # Special handling for Apple MOV files with GPS data
-            if needs_metadata_preservation:
-                logger.info("Using optimized approach for preserving metadata in MOV file")
-                
-                # For MOV files, we'll use the reddit approach but with specific flags
-                # This approach prioritizes metadata preservation for Apple devices
-                
-                # Create a temporary file path for the output
-                temp_output_path = os.path.join(temp_dir, "final_with_metadata.mov")
-                
-                # Command that takes the processed video and copies metadata from the original
-                # This specific order is important for Apple devices
-                metadata_command = [
-                    'ffmpeg',
-                    '-i', input_path,          # Original file with metadata (first input)
-                    '-i', temp_processed,      # Processed video (second input)
-                    '-map', '1:v',             # Use video from the processed file (second input)
-                    '-map_metadata', '0',      # Use metadata from the original file (first input)
-                    # Copy audio, subtitles, and other streams from original
-                    '-map', '0:a?',            # Copy audio if present, skip if absent
-                    '-map', '0:s?',            # Copy subtitles if present, skip if absent
-                    '-map', '0:d?',            # Copy data if present, skip if absent
-                    '-map', '0:t?',            # Copy timecodes if present, skip if absent
-                    # Copy all streams without re-encoding
-                    '-c', 'copy',
-                    # Add specific flags for QuickTime/MOV metadata handling
-                    '-movflags', 'use_metadata_tags+faststart',
-                    temp_output_path
-                ]
-                
-                # Run the command to copy metadata
-                logger.info("Copying metadata from original to processed video...")
-                self._run_ffmpeg_with_progress(
-                    metadata_command,
-                    1,  # Only one "frame" for this operation
-                    "Copying metadata"
-                )
-                
-                # For Apple MOV files, we need additional fixes
-                logger.info("Applying exiftool fixes for Apple QuickTime metadata...")
-                try:
-                    # First copy all metadata from original file to the processed file
-                    exiftool_copy_cmd = [
-                        'exiftool',
-                        '-m',                        # Ignore minor errors
-                        '-overwrite_original',       # Overwrite the output file
-                        '-api', 'LargeFileSupport=1',  # Support for large video files
-                        '-tagsFromFile', input_path, # Copy tags from the input file
-                        '-all:all',                  # Copy all tags
-                        '-GPS:all',                  # Specifically ensure GPS tags are copied
-                        '-Apple:all',                # Copy all Apple-specific tags
-                        '-quicktime:all',            # Copy all QuickTime tags
-                        temp_output_path             # The output file to modify
-                    ]
-                    
-                    logger.info("Copying metadata from original to processed file...")
-                    subprocess.run(exiftool_copy_cmd, 
-                                 stdout=subprocess.PIPE, 
-                                 stderr=subprocess.PIPE,
-                                 check=False)
-                    
-                    # Then apply the specialized fix for Apple QuickTime Keys metadata
-                    exiftool_keys_cmd = [
-                        'exiftool',
-                        '-m',                   # Ignore minor errors
-                        '-overwrite_original',  # Overwrite the original file
-                        '-api', 'LargeFileSupport=1',  # Support for large video files
-                        '-Keys:All=',           # First clear the Keys to avoid conflicts
-                        '-tagsFromFile', '@',   # Copy tags from the same file (self-reference)
-                        '-Keys:All',            # Then copy back all the Keys (including location)
-                        temp_output_path        # Target file to modify
-                    ]
-                    
-                    logger.info("Applying Apple QuickTime Keys metadata fix...")
-                    subprocess.run(exiftool_keys_cmd, 
-                                 stdout=subprocess.PIPE, 
-                                 stderr=subprocess.PIPE,
-                                 check=False)
-                    
-                    # Now move the final version to the requested output path
-                    shutil.copy2(temp_output_path, output_path)
-                    logger.info("Successfully applied metadata fixes with exiftool")
-                    
-                except Exception as e:
-                    logger.warning(f"Error applying exiftool fixes: {e}")
-                    # If exiftool fails, just use the ffmpeg output
-                    shutil.copy2(temp_output_path, output_path)
-            else:
-                # For non-MOV files, use the normal approach
-                logger.info("Using standard metadata preservation for non-MOV file")
-                
-                # The standard approach uses -map_metadata 0 to copy metadata
-                metadata_command = [
-                    'ffmpeg',
-                    '-i', input_path,          # Original file with metadata (first input)
-                    '-i', temp_processed,      # Processed video (second input)
-                    '-map', '1:v',             # Use video from the processed file (second input)
-                    '-map_metadata', '0',      # Use metadata from the original file (first input)
-                    # Copy audio and other streams from original
-                    '-map', '0:a?',            # Copy audio if present, skip if absent
-                    '-map', '0:s?',            # Copy subtitles if present, skip if absent
-                    '-c', 'copy',              # Copy all streams (no re-encoding)
-                    # Add movflags for better compatibility
-                    '-movflags', 'use_metadata_tags+faststart',
-                    output_path
-                ]
-                
-                # Run the command to copy metadata
-                self._run_ffmpeg_with_progress(
-                    metadata_command,
-                    1,  # Only one "frame" for this operation
-                    "Copying metadata"
-                )
-            
-            # Verify location data was preserved
-            verify_location_metadata(input_path, output_path)
+            # Copy metadata to the processed video
+            self._copy_video_metadata(input_path, temp_processed, output_path, is_quicktime, temp_dir)
             
             elapsed_time = time.time() - start_time
             logger.info(f"Saved corrected video: {output_path}")
             logger.info(f"Total processing time: {elapsed_time:.2f} seconds")
         finally:
-            # Clean up temporary directory even if processing is cancelled
+            # Clean up temporary directory
             if os.path.exists(temp_dir):
                 logger.info("Cleaning up temporary files...")
                 shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _process_frames_parallel(self, temp_dir, frame_files, num_workers):
+        """Process frames in parallel and return the count of successfully processed frames"""
+        completed_frames = 0
+        futures = []
+        
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all frame processing tasks
+            for i, filename in enumerate(frame_files):
+                if terminate_requested:
+                    break
+                    
+                futures.append((
+                    executor.submit(
+                        self._process_frame,
+                        os.path.join(temp_dir, filename),
+                        os.path.join(temp_dir, f"corrected_{i+1:04d}.jpg")
+                    ),
+                    i,
+                    filename
+                ))
+            
+            # Process results as they complete
+            progress_bar = tqdm(total=len(futures), desc="Processing frames")
+            for future, i, filename in [(f[0], f[1], f[2]) for f in futures]:
+                if future.done() or future.running():
+                    try:
+                        success = future.result()
+                        if success:
+                            completed_frames += 1
+                        else:
+                            logger.warning(f"Failed to process frame {i+1}")
+                    except Exception as e:
+                        logger.error(f"Error processing frame {i+1}: {e}")
+                        
+                    progress_bar.update(1)
+                    
+                if terminate_requested:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+            
+            progress_bar.close()
+        
+        return completed_frames
+
+    def _copy_video_metadata(self, input_path, temp_processed, output_path, is_quicktime, temp_dir):
+        """Copy metadata from original video to processed video"""
+        if is_quicktime:
+            logger.info("Using optimized approach for preserving metadata in QuickTime format")
+            
+            # Create a temporary file path for the output
+            temp_output_path = os.path.join(temp_dir, "final_with_metadata.mov")
+            
+            # Command for copying metadata
+            metadata_command = self._create_ffmpeg_metadata_command(
+                input_path, temp_processed, temp_output_path, is_quicktime=True
+            )
+            
+            # Run the command to copy metadata
+            logger.info("Copying metadata from original to processed video...")
+            self._run_ffmpeg_with_progress(metadata_command, 1, "Copying metadata")
+            
+            # For Apple MOV files, apply additional fixes with exiftool
+            logger.info("Applying exiftool fixes for Apple QuickTime metadata...")
+            try:
+                # Copy all metadata first
+                if copy_all_metadata_with_exiftool(input_path, temp_output_path):
+                    # Then apply the specialized QuickTime fix
+                    if fix_quicktime_metadata(temp_output_path):
+                        # Move the final version to the requested output path
+                        shutil.copy2(temp_output_path, output_path)
+                        logger.info("Successfully applied metadata fixes with exiftool")
+                    else:
+                        logger.warning("QuickTime metadata fix failed, using basic metadata copy")
+                        shutil.copy2(temp_output_path, output_path)
+                else:
+                    logger.warning("Metadata copy with exiftool failed, using basic metadata copy")
+                    shutil.copy2(temp_output_path, output_path)
+            except Exception as e:
+                logger.warning(f"Error applying exiftool fixes: {e}")
+                # If exiftool fails, just use the ffmpeg output
+                shutil.copy2(temp_output_path, output_path)
+        else:
+            # For non-QuickTime files, use the standard approach
+            logger.info("Using standard metadata preservation approach")
+            
+            # Create and run command for copying metadata
+            metadata_command = self._create_ffmpeg_metadata_command(
+                input_path, temp_processed, output_path, is_quicktime=False
+            )
+            self._run_ffmpeg_with_progress(metadata_command, 1, "Copying metadata")
+        
+        # Verify location data was preserved
+        verify_location_metadata(input_path, output_path)
 
     def process_batch(self, input_folder, output_folder, fps=None, num_workers=None):
         """
@@ -596,14 +624,12 @@ class UnderwaterImageProcessor:
         # Create output folder if it doesn't exist
         os.makedirs(output_folder, exist_ok=True)
         
-        # Get all files in the input folder
+        # Get all supported files in the input folder
         input_files = []
         for root, _, files in os.walk(input_folder):
             for file in files:
                 file_path = os.path.join(root, file)
-                # Check if file is a supported image or video
-                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff', 
-                                       '.mp4', '.avi', '.mov', '.mkv')):
+                if file_path.lower().endswith(SUPPORTED_EXTENSIONS):
                     input_files.append(file_path)
         
         if not input_files:
@@ -629,12 +655,11 @@ class UnderwaterImageProcessor:
                 # Create necessary subdirectories
                 os.makedirs(os.path.dirname(output_file), exist_ok=True)
                 
-                file_lower = input_file.lower()
-                if file_lower.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
+                if is_image_file(input_file):
                     logger.info(f"Processing image: {input_file}")
                     self.process_image(input_file, output_file)
                     successful += 1
-                elif file_lower.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                elif is_video_file(input_file):
                     logger.info(f"Processing video: {input_file}")
                     self.process_video(input_file, output_file, fps=fps, num_workers=num_workers)
                     successful += 1
@@ -649,214 +674,6 @@ class UnderwaterImageProcessor:
             logger.info(f"Batch processing completed. Processed {successful} files successfully, {failed} failed.")
         logger.info(f"Total processing time: {elapsed_time:.2f} seconds")
 
-    def _copy_location_metadata_with_exiftool(self, source_file, target_file):
-        """
-        Copy location metadata from source to target file using exiftool
-        exiftool has better support for GPS metadata than ffmpeg in some cases
-        
-        Args:
-            source_file: Path to the source file with GPS data
-            target_file: Path to the target file to copy GPS data to
-        
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            # Check if exiftool is available
-            try:
-                subprocess.run(['exiftool', '-ver'], 
-                               stdout=subprocess.PIPE, 
-                               stderr=subprocess.PIPE,
-                               check=True)
-                has_exiftool = True
-            except (subprocess.SubprocessError, FileNotFoundError):
-                logger.warning("exiftool not found, skipping additional location metadata copy")
-                return False
-                
-            if has_exiftool:
-                logger.info("Using exiftool to copy location metadata...")
-                
-                # First, check if source has GPS data
-                gps_info_cmd = ['exiftool', '-s', '-G', '-Location', '-GPS*', source_file]
-                result = subprocess.run(gps_info_cmd, 
-                                     stdout=subprocess.PIPE, 
-                                     stderr=subprocess.PIPE,
-                                     text=True)
-                
-                if not result.stdout.strip():
-                    logger.warning(f"No location data found in source file: {source_file}")
-                    return False
-                
-                logger.info(f"Found location data in source: {result.stdout.strip()}")
-                
-                # For MOV files, we need specific handling for QuickTime metadata structure
-                file_ext = os.path.splitext(target_file)[1].lower()
-                
-                if file_ext in ['.mov', '.mp4']:
-                    logger.info("Using QuickTime-specific method for GPS metadata...")
-                    # Extract GPS data from source
-                    extract_cmd = [
-                        'exiftool', '-j', 
-                        '-GPS:GPSLatitude',
-                        '-GPS:GPSLatitudeRef',
-                        '-GPS:GPSLongitude',
-                        '-GPS:GPSLongitudeRef',
-                        source_file
-                    ]
-                    
-                    extract_result = subprocess.run(extract_cmd, 
-                                                stdout=subprocess.PIPE, 
-                                                stderr=subprocess.PIPE,
-                                                text=True)
-                    
-                    if extract_result.returncode != 0:
-                        logger.warning(f"Failed to extract GPS data: {extract_result.stderr}")
-                        return False
-                    
-                    try:
-                        # Parse JSON result
-                        gps_data = json.loads(extract_result.stdout)[0]
-                        
-                        # Check if we have GPS data
-                        if not ('GPSLatitude' in gps_data and 'GPSLongitude' in gps_data):
-                            logger.warning("GPS data extraction returned empty results")
-                            return False
-                            
-                        # Apply GPS data directly to target in the QuickTime format
-                        lat = gps_data.get('GPSLatitude', '')
-                        lat_ref = gps_data.get('GPSLatitudeRef', 'N')
-                        lon = gps_data.get('GPSLongitude', '')
-                        lon_ref = gps_data.get('GPSLongitudeRef', 'E')
-                        
-                        logger.info(f"Found GPS: Lat: {lat} {lat_ref}, Lon: {lon} {lon_ref}")
-                        
-                        # Convert to standard format if in DMS format
-                        lat_formatted = lat
-                        lon_formatted = lon
-                        
-                        # Apply to the target file with various tag formats to ensure compatibility
-                        apply_cmd = [
-                            'exiftool',
-                            '-GPSLatitude=%s' % lat_formatted,
-                            '-GPSLatitudeRef=%s' % lat_ref,
-                            '-GPSLongitude=%s' % lon_formatted,
-                            '-GPSLongitudeRef=%s' % lon_ref,
-                            # Add QuickTime specific location tags
-                            '-XMP:GPSLatitude=%s' % lat_formatted,
-                            '-XMP:GPSLongitude=%s' % lon_formatted,
-                            # Add as a human-readable location string
-                            f'-LocationCreated="{lat_formatted} {lat_ref}, {lon_formatted} {lon_ref}"',
-                            '-LocationTaken=%s' % f"{lat_formatted} {lat_ref}, {lon_formatted} {lon_ref}",
-                            '-Location=%s' % f"{lat_formatted} {lat_ref}, {lon_formatted} {lon_ref}",
-                            # Update metadata from original
-                            '-TagsFromFile', source_file,
-                            '-xmp:all',
-                            '-iptc:all',
-                            '-P',  # Preserve existing tags
-                            '-overwrite_original',
-                            target_file
-                        ]
-                    except json.JSONDecodeError:
-                        logger.warning("Failed to parse GPS data")
-                        return False
-                    except Exception as e:
-                        logger.warning(f"Error processing GPS data: {e}")
-                        return False
-                else:
-                    # For non-MOV files, use the original approach
-                    apply_cmd = [
-                        'exiftool', '-TagsFromFile', source_file,
-                        '-gps:all',
-                        '-location:all',
-                        '-coordinates:all',
-                        '-xmp:geotag',
-                        '-P',
-                        '-overwrite_original',
-                        target_file
-                    ]
-                
-                # Run the command
-                result = subprocess.run(apply_cmd, 
-                                     stdout=subprocess.PIPE, 
-                                     stderr=subprocess.PIPE,
-                                     text=True)
-                
-                if result.returncode == 0:
-                    # Verify location metadata was transferred
-                    verify_cmd = ['exiftool', '-s', '-G', '-Location', '-GPS*', target_file]
-                    verify_result = subprocess.run(verify_cmd, 
-                                                stdout=subprocess.PIPE, 
-                                                stderr=subprocess.PIPE,
-                                                text=True)
-                    
-                    if verify_result.stdout.strip():
-                        logger.info(f"Successfully verified location metadata: {verify_result.stdout.strip()}")
-                        return True
-                    else:
-                        logger.warning("Location metadata transfer failed verification")
-                        return False
-                else:
-                    logger.warning(f"exiftool error: {result.stderr}")
-                    return False
-        except Exception as e:
-            logger.warning(f"Error using exiftool to copy metadata: {e}")
-            return False
-        
-        return False
-
-    def _add_quicktime_gps_metadata(self, input_path, output_path):
-        """
-        Special function to add GPS metadata to QuickTime MOV files in a format recognized by macOS
-        
-        Args:
-            input_path: Path to original file with GPS data
-            output_path: Path to processed file
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            # Check if exiftool is available
-            try:
-                subprocess.run(['exiftool', '-ver'], 
-                               stdout=subprocess.PIPE, 
-                               stderr=subprocess.PIPE,
-                               check=True)
-            except (subprocess.SubprocessError, FileNotFoundError):
-                logger.warning("exiftool not found, cannot add GPS metadata")
-                return False
-            
-            # Use the suggested command that properly preserves all Keys metadata (crucial for Apple devices)
-            logger.info("Using specialized exiftool command for Apple QuickTime metadata...")
-            cmd = [
-                'exiftool',
-                '-m',                   # Ignore minor errors
-                '-overwrite_original',  # Overwrite the original file
-                '-api', 'LargeFileSupport=1',  # Support for large video files
-                '-Keys:All=',           # First clear the Keys to avoid conflicts
-                '-tagsFromFile', '@',   # Copy tags from the same file (self-reference)
-                '-Keys:All',            # Then copy back all the Keys (including location)
-                output_path             # Target file to modify
-            ]
-            
-            # Execute the command
-            result = subprocess.run(cmd, 
-                                 stdout=subprocess.PIPE, 
-                                 stderr=subprocess.PIPE,
-                                 text=True)
-            
-            if result.returncode == 0:
-                logger.info("Successfully applied Apple QuickTime metadata fix")
-                # Return true even if there's a warning, as long as the command was successful
-                return True
-            else:
-                logger.warning(f"exiftool error: {result.stderr}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error in _add_quicktime_gps_metadata: {e}")
-            return False
-
 def verify_location_metadata(input_file, output_file):
     """
     Verify that location metadata was preserved by checking both files
@@ -868,7 +685,12 @@ def verify_location_metadata(input_file, output_file):
     Returns:
         bool: True if location metadata was preserved, False otherwise
     """
-    logger.info(f"Verifying location metadata preservation...")
+    logger.info("Verifying location metadata preservation...")
+    
+    if not check_exiftool_available():
+        logger.warning("Cannot verify location metadata: exiftool not available")
+        return False
+    
     try:
         # Use exiftool to check GPS data in both files
         cmd_original = ['exiftool', '-s', '-G', '-Location', '-GPS*', input_file]
@@ -912,6 +734,134 @@ def verify_location_metadata(input_file, output_file):
         logger.error(f"Error verifying location metadata: {e}")
         return False
 
+def get_exiftool_cmd_for_metadata_copy(source_file, target_file):
+    """Generate appropriate exiftool command for copying metadata"""
+    if is_quicktime_format(target_file):
+        # Extract GPS data from source
+        extract_cmd = [
+            'exiftool', '-j', 
+            '-GPS:GPSLatitude',
+            '-GPS:GPSLatitudeRef',
+            '-GPS:GPSLongitude',
+            '-GPS:GPSLongitudeRef',
+            source_file
+        ]
+        
+        extract_result = subprocess.run(extract_cmd, 
+                                    stdout=subprocess.PIPE, 
+                                    stderr=subprocess.PIPE,
+                                    text=True)
+        
+        if extract_result.returncode != 0:
+            logger.warning(f"Failed to extract GPS data: {extract_result.stderr}")
+            return None
+        
+        try:
+            # Parse JSON result
+            gps_data = json.loads(extract_result.stdout)[0]
+            
+            # Check if we have GPS data
+            if not ('GPSLatitude' in gps_data and 'GPSLongitude' in gps_data):
+                logger.warning("GPS data extraction returned empty results")
+                return None
+                
+            # Apply GPS data directly to target in the QuickTime format
+            lat = gps_data.get('GPSLatitude', '')
+            lat_ref = gps_data.get('GPSLatitudeRef', 'N')
+            lon = gps_data.get('GPSLongitude', '')
+            lon_ref = gps_data.get('GPSLongitudeRef', 'E')
+            
+            logger.info(f"Found GPS: Lat: {lat} {lat_ref}, Lon: {lon} {lon_ref}")
+            
+            location_string = f"{lat} {lat_ref}, {lon} {lon_ref}"
+            
+            # Apply to the target file with various tag formats for maximum compatibility
+            return [
+                'exiftool',
+                '-GPSLatitude=%s' % lat,
+                '-GPSLatitudeRef=%s' % lat_ref,
+                '-GPSLongitude=%s' % lon,
+                '-GPSLongitudeRef=%s' % lon_ref,
+                # Add QuickTime specific location tags
+                '-XMP:GPSLatitude=%s' % lat,
+                '-XMP:GPSLongitude=%s' % lon,
+                # Add as a human-readable location string
+                f'-LocationCreated="{location_string}"',
+                f'-LocationTaken="{location_string}"',
+                f'-Location="{location_string}"',
+                # Update metadata from original
+                '-TagsFromFile', source_file,
+                '-xmp:all',
+                '-iptc:all',
+                '-P',  # Preserve existing tags
+                '-overwrite_original',
+                target_file
+            ]
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"Error processing GPS data: {e}")
+            return None
+    else:
+        # For non-MOV/MP4 files, use the standard approach
+        return [
+            'exiftool', '-TagsFromFile', source_file,
+            '-gps:all',
+            '-location:all',
+            '-coordinates:all',
+            '-xmp:geotag',
+            '-P',
+            '-overwrite_original',
+            target_file
+        ]
+
+def fix_quicktime_metadata(file_path):
+    """Apply QuickTime metadata fix to ensure GPS data compatibility with Apple devices"""
+    if not check_exiftool_available():
+        return False
+
+    cmd = [
+        'exiftool',
+        '-m',                   # Ignore minor errors
+        '-overwrite_original',  # Overwrite the original file
+        '-api', 'LargeFileSupport=1',  # Support for large video files
+        '-Keys:All=',           # First clear the Keys to avoid conflicts
+        '-tagsFromFile', '@',   # Copy tags from the same file (self-reference)
+        '-Keys:All',            # Then copy back all the Keys (including location)
+        file_path               # Target file to modify
+    ]
+    
+    # Execute the command
+    result = subprocess.run(cmd, 
+                         stdout=subprocess.PIPE, 
+                         stderr=subprocess.PIPE,
+                         text=True)
+    
+    return result.returncode == 0
+
+def copy_all_metadata_with_exiftool(source_file, target_file):
+    """Copy all metadata from source to target file using exiftool"""
+    if not check_exiftool_available():
+        return False
+
+    cmd = [
+        'exiftool',
+        '-m',                        # Ignore minor errors
+        '-overwrite_original',       # Overwrite the output file
+        '-api', 'LargeFileSupport=1',  # Support for large video files
+        '-tagsFromFile', source_file, # Copy tags from the input file
+        '-all:all',                  # Copy all tags
+        '-GPS:all',                  # Specifically ensure GPS tags are copied
+        '-Apple:all',                # Copy all Apple-specific tags
+        '-quicktime:all',            # Copy all QuickTime tags
+        target_file                  # The output file to modify
+    ]
+    
+    result = subprocess.run(cmd, 
+                         stdout=subprocess.PIPE, 
+                         stderr=subprocess.PIPE,
+                         check=False)
+    
+    return result.returncode == 0
+
 def test_location_preservation(input_file=None):
     """
     Run test for location metadata preservation
@@ -938,11 +888,10 @@ def test_location_preservation(input_file=None):
     try:
         # Process the file
         processor = UnderwaterImageProcessor()
-        file_lower = input_file.lower()
         
-        if file_lower.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
+        if is_image_file(input_file):
             processor.process_image(input_file, output_file)
-        elif file_lower.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+        elif is_video_file(input_file):
             processor.process_video(input_file, output_file)
         else:
             logger.error(f"Unsupported file format: {input_file}")
@@ -1009,8 +958,8 @@ def main():
     # Adjust parameters for fast mode
     if args.fast:
         logger.info("Using fast mode with optimized parameters")
-        # In fast mode, reduce dehaze strength and use lower quality ffmpeg settings
-        args.dehaze = min(args.dehaze, 0.3)  # Lower dehaze is faster
+        # In fast mode, reduce dehaze strength for faster processing
+        args.dehaze = min(args.dehaze, 0.3)
     
     # Initialize processor
     processor = UnderwaterImageProcessor(
@@ -1029,10 +978,9 @@ def main():
         processor.process_batch(args.input, args.output, fps=args.fps, num_workers=args.workers)
     else:
         # Process single file
-        input_lower = args.input.lower()
-        if input_lower.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
+        if is_image_file(args.input):
             processor.process_image(args.input, args.output)
-        elif input_lower.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+        elif is_video_file(args.input):
             processor.process_video(args.input, args.output, fps=args.fps, num_workers=args.workers)
         else:
             logger.error(f"Unsupported file format: {args.input}")
