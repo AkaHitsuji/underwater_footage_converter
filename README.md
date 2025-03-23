@@ -2,6 +2,11 @@
 
 A tool for restoring natural colors in underwater images and videos by compensating for spectral absorption and blue-green color shift.
 
+## TODO
+- [ ] Convert to generic script that can do multiple other things like compression
+- [ ] Consider chrome extension or webpage
+
+
 ## Features
 
 - Processes both images and videos
