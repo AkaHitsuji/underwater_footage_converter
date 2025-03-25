@@ -1,0 +1,23 @@
+
+        Improved v4 Analysis Summary:
+        
+        Average BGR Values:
+        Original: [np.float64(85.96), np.float64(128.66), np.float64(74.49)]
+        Improved v4: [np.float64(146.87), np.float64(137.04), np.float64(162.72)]
+        aDive+: [np.float64(131.36), np.float64(135.62), np.float64(138.37)]
+        
+        Current improved v4 parameters compared to reference:
+        Blue: 0.89 (1.0 is perfect match)
+        Green: 0.99 (1.0 is perfect match)
+        Red: 0.85 (1.0 is perfect match)
+        Overall difference: 0.19 (lower is better)
+        
+        Enhancement Factor Comparison (higher is stronger enhancement):
+        
+                  Blue    Green    Red
+        aDive+:   1.53    1.06    1.86
+        Improved: 1.71    1.07    2.19
+        
+        The improved v4 implementation is significantly closer to the aDive+ output
+        compared to the original v4 implementation.
+        

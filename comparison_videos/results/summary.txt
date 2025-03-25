@@ -1,0 +1,18 @@
+
+        Video Analysis Summary:
+        
+        Average BGR Values:
+        Original: [np.float64(85.96), np.float64(128.66), np.float64(74.49)]
+        Script v4: [np.float64(120.61), np.float64(114.61), np.float64(122.19)]
+        aDive+: [np.float64(131.36), np.float64(135.62), np.float64(138.37)]
+        
+        Current v4 parameters need adjustment by these factors:
+        Blue: 1.09
+        Green: 1.18
+        Red: 1.13
+        
+        Recommended absolute parameters for v4:
+        blue_boost: 1.53 (currently: 1.40)
+        green_factor: 1.06 (currently: 0.89)
+        red_boost: 1.86 (currently: 1.64)
+        
