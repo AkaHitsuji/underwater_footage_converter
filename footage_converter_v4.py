@@ -123,7 +123,7 @@ class UnderwaterImageProcessor:
             '-crf', str(crf),  # Higher CRF value (default 28) for smaller size
             '-pix_fmt', 'yuv420p',
             '-threads', str(num_workers),
-            '-vf', f'scale={width}:{height}',
+            '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,setdar=1/1,setsar=1/1',
             '-tag:v', 'hvc1',  # Ensure compatibility with Apple devices
             '-movflags', '+faststart',
             output_path
