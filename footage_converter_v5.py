@@ -80,9 +80,9 @@ def check_exiftool_available():
 class AutoColorUnderwaterImageProcessor:
     """Enhanced processor for underwater images with automatic color parameter selection"""
     
-    def __init__(self, contrast_limit=2.0, saturation_factor=0.85, 
-                 brightness_boost=1.08, white_balance_strength=0.6,
-                 auto_tune_strength=0.85):
+    def __init__(self, contrast_limit=2.0, saturation_factor=0.9, 
+                 brightness_boost=1.12, white_balance_strength=0.7,
+                 auto_tune_strength=0.9, sharpness=0.0):
         """
         Initialize the underwater image processor with automatic color parameter selection
         
@@ -93,6 +93,7 @@ class AutoColorUnderwaterImageProcessor:
             white_balance_strength: Strength of white balancing
             auto_tune_strength: Strength of the automatic parameter tuning (0-1)
                                Higher values apply more aggressive automatic adjustments
+            sharpness: Sharpness enhancement factor (0.0-1.0)
         """
         # Core parameters (we'll auto-tune RGB values)
         self.contrast_limit = contrast_limit
@@ -100,11 +101,12 @@ class AutoColorUnderwaterImageProcessor:
         self.brightness_boost = brightness_boost
         self.white_balance_strength = white_balance_strength
         self.auto_tune_strength = auto_tune_strength
+        self.sharpness = sharpness
         
         # Default RGB values (will be overridden by auto-tuning)
-        # More aggressive blue boost and reduced red to prevent reddish tint
-        self.red_boost = 1.05
-        self.blue_boost = 1.35
+        # More balanced boost with reduced blue
+        self.red_boost = 1.1
+        self.blue_boost = 1.25
         self.green_factor = 0.95
         
         # Create CLAHE object for contrast enhancement
@@ -119,19 +121,20 @@ class AutoColorUnderwaterImageProcessor:
     def _create_ffmpeg_extraction_command(self, input_path, frames_path, num_workers):
         """Create FFmpeg command for extracting frames from video"""
         return [
-            'ffmpeg', '-i', input_path, '-qscale:v', '2', 
+            'ffmpeg', '-i', input_path, 
+            '-qscale:v', '1',  # Highest quality (1-31, lower is better)
             '-threads', str(num_workers),
             frames_path
         ]
 
-    def _create_ffmpeg_encoding_command(self, frames_path, output_path, fps, width, height, num_workers, crf=28):
+    def _create_ffmpeg_encoding_command(self, frames_path, output_path, fps, width, height, num_workers, crf=24):
         """Create FFmpeg command for encoding frames into video"""
         return [
             'ffmpeg', '-r', str(fps),
             '-i', frames_path,
             '-c:v', 'libx265',  # Use HEVC codec 
-            '-preset', 'medium',  # Use medium preset (balance between speed and compression)
-            '-crf', str(crf),  # Higher CRF value (default 28) for smaller size
+            '-preset', 'slow',  # Use slow preset for better quality/compression ratio
+            '-crf', str(crf),  # Lower CRF value for better quality (default lowered to 24)
             '-pix_fmt', 'yuv420p',
             '-threads', str(num_workers),
             '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,setdar=1/1,setsar=1/1',
@@ -325,38 +328,38 @@ class AutoColorUnderwaterImageProcessor:
         g_ratio = g_avg / avg_color if avg_color > 0 else 1.0
         b_ratio = b_avg / avg_color if avg_color > 0 else 1.0
         
-        # Determine scene type and appropriate parameters - optimized for vibrant blues
+        # Determine scene type and appropriate parameters - balanced for vibrant but natural colors
         is_deep_blue = (b_avg > 0.5 and b_avg > r_avg * 1.5 and b_avg > g_avg * 1.2)
         is_greenish = (g_avg > r_avg * 1.2 and g_avg > b_avg * 1.1)
         is_balanced = (max(r_ratio, g_ratio, b_ratio) / min(r_ratio, g_ratio, b_ratio) < 1.3)
         
-        # Calculate optimal color boosts based on water color and scene type
+        # Calculate optimal color boosts based on water color and scene type - reduced blue boost
         if is_deep_blue:
-            # Deep blue water (reduced red boost, enhanced blue for vibrant ocean)
-            optimal_red_boost = 1.05 + (1.0 - r_avg) * 0.2  # Further reduced red boost
-            optimal_blue_boost = 1.35 + b_avg * 0.1  # Higher blue boost
+            # Deep blue water (moderate red boost, moderate blue for natural ocean)
+            optimal_red_boost = 1.1 + (1.0 - r_avg) * 0.2
+            optimal_blue_boost = 1.2 + b_avg * 0.1  # Reduced blue boost
             optimal_green_factor = 0.95 + (g_avg - r_avg) * 0.1  # Preserve more green
         elif is_greenish:
             # Greenish water (balanced approach to reduce green dominance)
-            optimal_red_boost = 1.05 + (1.0 - r_avg) * 0.15  # Reduced red boost
-            optimal_blue_boost = 1.4 + (0.5 - b_avg) * 0.2  # Higher blue boost
-            optimal_green_factor = 0.9 - (g_avg - r_avg) * 0.1  # Moderate green reduction
+            optimal_red_boost = 1.1 + (1.0 - r_avg) * 0.15
+            optimal_blue_boost = 1.25 + (0.5 - b_avg) * 0.2  # Reduced blue boost
+            optimal_green_factor = 0.9 - (g_avg - r_avg) * 0.1
         elif is_balanced:
             # Already balanced scene (preserve natural balance while enhancing vibrance)
-            optimal_red_boost = 1.05 + (1.0 - r_avg) * 0.1
-            optimal_blue_boost = 1.35  # Higher blue boost for vibrant water
+            optimal_red_boost = 1.1 + (1.0 - r_avg) * 0.1
+            optimal_blue_boost = 1.2  # More moderate blue boost for natural water
             optimal_green_factor = 0.98
         else:
-            # General case - boost blues more than reds for vibrant water colors
-            optimal_red_boost = 1.05 + (1.0 - r_ratio) * 0.15  # Reduced red boost
-            optimal_blue_boost = 1.4 + (1.0 - b_ratio) * 0.15  # Enhanced blue
+            # General case - more balanced approach for vibrant but natural water colors
+            optimal_red_boost = 1.1 + (1.0 - r_ratio) * 0.15
+            optimal_blue_boost = 1.25 + (1.0 - b_ratio) * 0.15  # Reduced blue
             optimal_green_factor = 0.95 + (1.0 - g_ratio) * 0.1
         
         # Apply auto_tune_strength parameter to control intensity of auto-tuning
         # Blend with default values based on auto_tune_strength
-        # Default values optimized for vibrant blues and reduced reds
-        default_red = 1.05   # Further reduced red boost
-        default_blue = 1.35  # Higher blue boost
+        # Default values for vibrant but natural colors
+        default_red = 1.1   # Moderate red boost
+        default_blue = 1.25  # Moderate blue boost
         default_green = 0.95  # Preserve more green
         
         # Apply blending
@@ -365,9 +368,9 @@ class AutoColorUnderwaterImageProcessor:
         green_factor = default_green * (1.0 - self.auto_tune_strength) + optimal_green_factor * self.auto_tune_strength
         
         # Clamp to reasonable ranges
-        red_boost = np.clip(red_boost, 1.0, 1.3)  # Lower red limits
-        blue_boost = np.clip(blue_boost, 1.2, 1.7)  # Higher blue limits
-        green_factor = np.clip(green_factor, 0.85, 1.05)  # Allow for some green enhancement
+        red_boost = np.clip(red_boost, 1.0, 1.3)
+        blue_boost = np.clip(blue_boost, 1.15, 1.5)  # Lower maximum blue boost
+        green_factor = np.clip(green_factor, 0.85, 1.05)
         
         return red_boost, blue_boost, green_factor
 
@@ -420,12 +423,12 @@ class AutoColorUnderwaterImageProcessor:
         # Apply CLAHE to L channel for adaptive contrast enhancement
         l_enhanced = self.clahe.apply(l)
         
-        # Step 3: Color correction in LAB space - balanced to reduce red tint and enhance blue
+        # Step 3: Color correction in LAB space - balanced to reduce red tint and moderate blue
         # Shift a channel (green-red axis) - reduced red shift
-        a_shifted = cv2.addWeighted(a, 1.0, np.ones_like(a) * 128, 0.0, 2.0)  # Further reduced from 3.0
+        a_shifted = cv2.addWeighted(a, 1.0, np.ones_like(a) * 128, 0.0, 2.0)
         
-        # Shift b channel (blue-yellow axis) - enhanced blue for more vibrant ocean colors
-        b_shifted = cv2.addWeighted(b, 1.0, np.ones_like(b) * 128, 0.0, -5.0)  # Stronger blue shift from -4.0
+        # Shift b channel (blue-yellow axis) - moderate blue for more natural ocean colors
+        b_shifted = cv2.addWeighted(b, 1.0, np.ones_like(b) * 128, 0.0, -4.0)  # Reduced from -5.0
         
         # Merge LAB channels and convert back to BGR
         enhanced_lab = cv2.merge([l_enhanced, a_shifted, b_shifted])
@@ -436,18 +439,18 @@ class AutoColorUnderwaterImageProcessor:
         
         # Step 5: Apply vibrance enhancement - increases saturation of less-saturated colors 
         # while preserving already saturated areas and skin tones
-        enhanced_bgr = self._apply_vibrance(enhanced_bgr, factor=0.5)  # Increased from 0.4
+        enhanced_bgr = self._apply_vibrance(enhanced_bgr, factor=0.5)
         
         # Step 6: Adjust saturation and brightness in HSV space
         enhanced_hsv = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2HSV)
         h, s, v = cv2.split(enhanced_hsv)
         
         # Apply enhanced saturation with protection for already saturated areas
-        adjusted_saturation = self.saturation_factor * 1.3  # Further boost saturation
+        adjusted_saturation = self.saturation_factor * 1.3
         s = np.clip(s * adjusted_saturation, 0, 255).astype(np.uint8)
         
         # Boost brightness with highlights protection
-        adjusted_brightness = self.brightness_boost * 1.05  # Slight brightness increase
+        adjusted_brightness = self.brightness_boost * 1.05
         v = np.clip(v * adjusted_brightness, 0, 255).astype(np.uint8)
         
         # Merge HSV channels and convert back to BGR
@@ -456,6 +459,10 @@ class AutoColorUnderwaterImageProcessor:
         
         # Apply final tone mapping for better color balance
         final_image = self._tone_matching(adjusted_bgr)
+        
+        # Apply sharpening if requested
+        if self.sharpness > 0:
+            final_image = self._apply_sharpening(final_image)
         
         return final_image
     
@@ -514,9 +521,9 @@ class AutoColorUnderwaterImageProcessor:
         r_eq = cv2.equalizeHist(r)
         g_eq = cv2.equalizeHist(g)  # Also equalize green for more vibrance
         
-        # Blend equalized image with original - optimized for vibrant ocean colors
-        b_final = cv2.addWeighted(b, 0.4, b_eq, 0.6, 0)  # More blue equalization for vibrance
-        r_final = cv2.addWeighted(r, 0.8, r_eq, 0.2, 0)  # Less red equalization to reduce red tint
+        # Blend equalized image with original - balanced for vibrant natural colors
+        b_final = cv2.addWeighted(b, 0.5, b_eq, 0.5, 0)  # Reduced blue equalization
+        r_final = cv2.addWeighted(r, 0.75, r_eq, 0.25, 0)  # Less red equalization
         g_final = cv2.addWeighted(g, 0.6, g_eq, 0.4, 0)  # More green equalization for vibrance
         
         # Create the final image with adjusted channels
@@ -556,6 +563,24 @@ class AutoColorUnderwaterImageProcessor:
         # Recombine the channels
         enhanced_hsv = cv2.merge([h, s, v])
         return cv2.cvtColor(enhanced_hsv, cv2.COLOR_HSV2BGR)
+
+    def _apply_sharpening(self, image):
+        """Apply sharpening to the image with adjustable strength"""
+        # No sharpening if strength is 0
+        if self.sharpness <= 0:
+            return image
+            
+        # Create a blurred version for unsharp mask
+        blur = cv2.GaussianBlur(image, (0, 0), 3)
+        
+        # Create the unsharp mask by subtracting the blurred image
+        unsharp_mask = cv2.addWeighted(image, 1.0 + self.sharpness, blur, -self.sharpness, 0)
+        
+        # Apply a slight bilateral filter to reduce noise enhancement from sharpening
+        if self.sharpness > 0.3:
+            unsharp_mask = cv2.bilateralFilter(unsharp_mask, 5, 20, 20)
+            
+        return unsharp_mask
 
     def process_image(self, input_path, output_path):
         """
@@ -670,7 +695,7 @@ class AutoColorUnderwaterImageProcessor:
             
         return False
 
-    def process_video(self, input_path, output_path, fps=None, num_workers=None, crf=28):
+    def process_video(self, input_path, output_path, fps=None, num_workers=None, crf=24):
         """
         Process a video file with auto-optimized color parameters
         
@@ -867,7 +892,7 @@ class AutoColorUnderwaterImageProcessor:
         # Verify location data was preserved
         verify_location_metadata(input_path, output_path)
 
-    def process_batch(self, input_folder, output_folder, fps=None, num_workers=None, crf=28):
+    def process_batch(self, input_folder, output_folder, fps=None, num_workers=None, crf=24):
         """
         Process all supported files in a folder
         
@@ -1183,12 +1208,14 @@ def main():
     parser.add_argument("--brightness", "-B", type=float, default=1.12, help="Brightness boost factor")
     parser.add_argument("--white-balance", "-wb", type=float, default=0.7, help="White balance strength (0-1 range)")
     parser.add_argument("--auto-tune", "-a", type=float, default=0.9, help="Auto-tuning strength (0-1 range). Controls how aggressively the algorithm applies optimized color parameters.")
+    parser.add_argument("--sharpness", "-sh", type=float, default=0.3, help="Sharpness enhancement factor (0-1 range). 0 for no sharpening.")
     parser.add_argument("--fps", type=float, help="Output frames per second (default: same as input)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     parser.add_argument("--workers", "-w", type=int, help="Number of worker threads for parallel processing (default: CPU count)")
     parser.add_argument("--batch", action="store_true", help="Process input as a folder containing multiple files")
     parser.add_argument("--test-location", "-t", action="store_true", help="Run test for location metadata preservation")
-    parser.add_argument("--quality", "-q", type=int, default=28, help="Video quality (CRF value: 18-28 range, lower = better quality, higher = smaller size)")
+    parser.add_argument("--quality", "-q", type=int, default=24, help="Video quality (CRF value: 18-28 range, lower = better quality, higher = smaller size)")
+    parser.add_argument("--high-quality", "-hq", action="store_true", help="Use high quality preset (CRF 20, slow preset) for best quality output")
     
     args = parser.parse_args()
     
@@ -1216,18 +1243,25 @@ def main():
     
     logger.info(f"Output: {args.output}")
     
+    # Apply high quality settings if requested
+    if args.high_quality:
+        args.quality = 20
+        logger.info("Using high quality preset (CRF 20)")
+    
     # Initialize processor with command-line parameters
     processor = AutoColorUnderwaterImageProcessor(
         contrast_limit=args.contrast,
         saturation_factor=args.saturation,
         brightness_boost=args.brightness,
         white_balance_strength=args.white_balance,
-        auto_tune_strength=args.auto_tune
+        auto_tune_strength=args.auto_tune,
+        sharpness=args.sharpness
     )
     
     logger.info(f"Processing parameters: contrast={args.contrast}, saturation={args.saturation}, " +
                 f"brightness={args.brightness}, white_balance={args.white_balance}, " + 
-                f"auto_tune_strength={args.auto_tune}, video quality={args.quality}")
+                f"auto_tune_strength={args.auto_tune}, sharpness={args.sharpness}, " +
+                f"video quality={args.quality}")
     logger.info("RGB color parameters will be automatically optimized for each image/video")
     
     # Process based on input type
