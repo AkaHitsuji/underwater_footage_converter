@@ -1004,7 +1004,7 @@ class AutoColorUnderwaterImageProcessor:
         # Verify location data was preserved
         verify_location_metadata(input_path, output_path)
 
-    def process_batch(self, input_folder, output_folder, fps=None, num_workers=None, crf=24):
+    def process_batch(self, input_folder, output_folder, fps=None, num_workers=None, crf=24, output_format=None):
         """
         Process all supported files in a folder
         
@@ -1014,6 +1014,7 @@ class AutoColorUnderwaterImageProcessor:
             fps: Frames per second for videos (if None, detect from source)
             num_workers: Number of parallel workers (defaults to CPU count)
             crf: Constant Rate Factor for video quality (lower = better quality, higher = smaller size)
+            output_format: If specified, convert all output files to this format (e.g., 'mp4')
         """
         start_time = time.time()
         
@@ -1047,6 +1048,10 @@ class AutoColorUnderwaterImageProcessor:
                 # Determine relative path to maintain folder structure
                 rel_path = os.path.relpath(input_file, input_folder)
                 output_file = os.path.join(output_folder, rel_path)
+                
+                # Modify output extension if output_format is specified
+                if output_format and output_format.lower() == 'mp4' and is_video_file(input_file):
+                    output_file = os.path.splitext(output_file)[0] + '.mp4'
                 
                 # Create necessary subdirectories
                 os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -1331,6 +1336,7 @@ def main():
     parser.add_argument("--test-location", "-t", action="store_true", help="Run test for location metadata preservation")
     parser.add_argument("--quality", "-q", type=int, default=24, help="Video quality (CRF value: 18-28 range, lower = better quality, higher = smaller size)")
     parser.add_argument("--high-quality", "-hq", action="store_true", help="Use high quality preset (CRF 20, slow preset) for best quality output")
+    parser.add_argument("--output-format", "-f", choices=["mp4"], help="Convert output videos to the specified format. Currently only supports mp4.")
     
     args = parser.parse_args()
     
@@ -1354,7 +1360,11 @@ def main():
         if os.path.isdir(args.input) or args.batch:
             args.output = str(input_path.with_name(f"{input_path.name}_converted"))
         else:
-            args.output = str(input_path.with_name(f"{input_path.stem}_converted{input_path.suffix}"))
+            output_suffix = input_path.suffix
+            # If output format is specified and is a video file, use that format
+            if args.output_format and args.output_format.lower() == 'mp4' and is_video_file(args.input):
+                output_suffix = '.mp4'
+            args.output = str(input_path.with_name(f"{input_path.stem}_converted{output_suffix}"))
     
     logger.info(f"Output: {args.output}")
     
@@ -1377,19 +1387,30 @@ def main():
                 f"brightness={args.brightness}, white_balance={args.white_balance}, " + 
                 f"auto_tune_strength={args.auto_tune}, sharpness={args.sharpness}, " +
                 f"video quality={args.quality}")
+    if args.output_format:
+        logger.info(f"Output format set to: {args.output_format}")
     logger.info("RGB color parameters will be automatically optimized for each image/video")
     
     # Process based on input type
     if os.path.isdir(args.input) or args.batch:
         # Process as batch
         logger.info(f"Processing folder: {args.input}")
-        processor.process_batch(args.input, args.output, fps=args.fps, num_workers=args.workers, crf=args.quality)
+        processor.process_batch(args.input, args.output, fps=args.fps, num_workers=args.workers, 
+                               crf=args.quality, output_format=args.output_format)
     else:
         # Process single file
         if is_image_file(args.input):
             processor.process_image(args.input, args.output)
         elif is_video_file(args.input):
-            processor.process_video(args.input, args.output, fps=args.fps, num_workers=args.workers, crf=args.quality)
+            # Check if we should force MP4 output
+            if args.output_format and args.output_format.lower() == 'mp4':
+                output_path = args.output
+                # Ensure the output has .mp4 extension
+                if not output_path.lower().endswith('.mp4'):
+                    output_path = os.path.splitext(output_path)[0] + '.mp4'
+                processor.process_video(args.input, output_path, fps=args.fps, num_workers=args.workers, crf=args.quality)
+            else:
+                processor.process_video(args.input, args.output, fps=args.fps, num_workers=args.workers, crf=args.quality)
         else:
             logger.error(f"Unsupported file format: {args.input}")
             return 1
