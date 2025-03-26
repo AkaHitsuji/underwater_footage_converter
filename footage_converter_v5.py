@@ -104,10 +104,13 @@ class AutoColorUnderwaterImageProcessor:
         self.sharpness = sharpness
         
         # Default RGB values (will be overridden by auto-tuning)
-        # More balanced boost with reduced blue
-        self.red_boost = 1.1
+        # More balanced boost with reduced red
+        self.red_boost = 1.0  # Changed from 1.1 - no red boost by default
         self.blue_boost = 1.25
         self.green_factor = 0.95
+        
+        # NEW: Flag to indicate if the scene has red-tinted rocks
+        self.has_red_tinted_rocks = False
         
         # Create CLAHE object for contrast enhancement
         self.clahe = cv2.createCLAHE(clipLimit=self.contrast_limit, tileGridSize=(8, 8))
@@ -278,12 +281,16 @@ class AutoColorUnderwaterImageProcessor:
         lab = cv2.cvtColor(analysis_img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         
+        # Analyze a channel (red-green axis) to detect red tinting
+        # Higher values in 'a' channel indicate more red
+        mean_a = np.mean(a) - 128  # Centered around 0, positive = red, negative = green
+        
         # Step 3: Analyze water color cast using K-means clustering
         # Reshape for clustering
         pixels = analysis_img.reshape(-1, 3)
         
         # Choose K based on the complexity of the underwater scene
-        k = 5
+        k = 8  # Increased from 5 to better detect different elements in the scene
         kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
         kmeans.fit(pixels)
         
@@ -316,7 +323,6 @@ class AutoColorUnderwaterImageProcessor:
         water_color = water_color / 255.0
         b_water, g_water, r_water = water_color
         
-        # Step 4: Calculate optimal RGB boosts based on color cast
         # Analyze color balance 
         r_avg = np.mean(analysis_img[:,:,2]) / 255.0
         g_avg = np.mean(analysis_img[:,:,1]) / 255.0
@@ -327,38 +333,102 @@ class AutoColorUnderwaterImageProcessor:
         r_ratio = r_avg / avg_color if avg_color > 0 else 1.0
         g_ratio = g_avg / avg_color if avg_color > 0 else 1.0
         b_ratio = b_avg / avg_color if avg_color > 0 else 1.0
+
+        # Red tint detection - using color ratios and LAB analysis
+        is_red_tinted = (r_ratio > 1.05 and r_ratio > g_ratio and mean_a > 2)
         
-        # Determine scene type and appropriate parameters - balanced for vibrant but natural colors
+        # NEW: Improved detection of neutral colors with red tint (rocks, sand, etc.)
+        # Convert to HSV for better color analysis
+        hsv_img = cv2.cvtColor(analysis_img, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv_img)
+        
+        # Function to detect rock-like colors
+        def detect_red_tinted_rocks():
+            """Enhanced detection of red-tinted rock-like elements in the scene"""
+            red_rock_count = 0
+            total_clusters = len(dominant_colors)
+            
+            for i, cluster_color in enumerate(dominant_colors):
+                # Skip tiny clusters
+                if counts[sorted_indices[i]] < len(pixels) * 0.03:  # Skip clusters smaller than 3%
+                    continue
+                    
+                # Convert to BGR
+                b, g, r = cluster_color
+                
+                # Convert to HSV for better color analysis
+                hsv_color = cv2.cvtColor(np.uint8([[cluster_color]]), cv2.COLOR_BGR2HSV)[0][0]
+                hue, sat, val = hsv_color
+                
+                # Check for colors that would be gray/neutral except for red tinting:
+                # 1. Low saturation (grayish)
+                is_low_saturation = sat < 90
+                
+                # 2. Rock-like value (not too dark, not too bright)
+                is_rock_brightness = 60 < val < 200
+                
+                # 3. But with red hue bias or red > other channels
+                is_reddish = (hue < 10 or hue > 170) or (r > g * 1.1 and r > b * 1.1)
+                
+                # 4. Relatively balanced RGB values (would be neutral without tint)
+                rgb_range = max(r, g, b) - min(r, g, b)
+                is_potentially_neutral = rgb_range < 50
+                
+                if (is_low_saturation or is_potentially_neutral) and is_rock_brightness and is_reddish:
+                    red_rock_count += 1
+                    logger.debug(f"Detected red-tinted rock-like cluster: {cluster_color}, HSV: {hsv_color}")
+            
+            # Consider it a red-tinted rock scene if enough clusters match
+            has_red_rocks = red_rock_count >= 2
+            
+            # Also check if overall scene has low saturation but red tint
+            overall_low_sat = np.mean(s) < 80
+            overall_red_tint = r_ratio > 1.05 and mean_a > 0
+            
+            return has_red_rocks or (overall_low_sat and overall_red_tint)
+            
+        # Run the enhanced rock detection
+        has_red_tinted_rocks = detect_red_tinted_rocks()
+        self.has_red_tinted_rocks = has_red_tinted_rocks  # Store this for later use
+        
+        # Final red tint detection combines multiple methods
+        needs_red_correction = is_red_tinted or has_red_tinted_rocks
+        
+        # Determine scene type
         is_deep_blue = (b_avg > 0.5 and b_avg > r_avg * 1.5 and b_avg > g_avg * 1.2)
         is_greenish = (g_avg > r_avg * 1.2 and g_avg > b_avg * 1.1)
         is_balanced = (max(r_ratio, g_ratio, b_ratio) / min(r_ratio, g_ratio, b_ratio) < 1.3)
         
-        # Calculate optimal color boosts based on water color and scene type - reduced blue boost
-        if is_deep_blue:
-            # Deep blue water (moderate red boost, moderate blue for natural ocean)
-            optimal_red_boost = 1.1 + (1.0 - r_avg) * 0.2
-            optimal_blue_boost = 1.2 + b_avg * 0.1  # Reduced blue boost
-            optimal_green_factor = 0.95 + (g_avg - r_avg) * 0.1  # Preserve more green
+        # Calculate optimal color boosts based on scene type
+        if needs_red_correction:
+            # Strong correction for red-tinted scenes, especially with neutral objects like rocks
+            optimal_red_boost = 0.85 if has_red_tinted_rocks else 0.9  # Stronger red reduction for rock scenes
+            optimal_blue_boost = 1.2  # Moderate blue boost
+            optimal_green_factor = 1.1  # Stronger green boost to balance red reduction
+            logger.info(f"Detected red-tinted scene with rocks={has_red_tinted_rocks}, applying strong red reduction (red_ratio={r_ratio:.2f}, a_mean={mean_a:.2f})")
+        elif is_deep_blue:
+            # Deep blue water
+            optimal_red_boost = 1.0  # No red boost
+            optimal_blue_boost = 1.2 + b_avg * 0.1
+            optimal_green_factor = 0.95 + (g_avg - r_avg) * 0.1
         elif is_greenish:
-            # Greenish water (balanced approach to reduce green dominance)
-            optimal_red_boost = 1.1 + (1.0 - r_avg) * 0.15
-            optimal_blue_boost = 1.25 + (0.5 - b_avg) * 0.2  # Reduced blue boost
+            # Greenish water
+            optimal_red_boost = 1.0  # No red boost
+            optimal_blue_boost = 1.25 + (0.5 - b_avg) * 0.2
             optimal_green_factor = 0.9 - (g_avg - r_avg) * 0.1
         elif is_balanced:
-            # Already balanced scene (preserve natural balance while enhancing vibrance)
-            optimal_red_boost = 1.1 + (1.0 - r_avg) * 0.1
-            optimal_blue_boost = 1.2  # More moderate blue boost for natural water
+            # Already balanced scene
+            optimal_red_boost = 1.0  # No red boost
+            optimal_blue_boost = 1.2
             optimal_green_factor = 0.98
         else:
-            # General case - more balanced approach for vibrant but natural water colors
-            optimal_red_boost = 1.1 + (1.0 - r_ratio) * 0.15
-            optimal_blue_boost = 1.25 + (1.0 - b_ratio) * 0.15  # Reduced blue
+            # General case
+            optimal_red_boost = 1.0  # No red boost
+            optimal_blue_boost = 1.2
             optimal_green_factor = 0.95 + (1.0 - g_ratio) * 0.1
         
-        # Apply auto_tune_strength parameter to control intensity of auto-tuning
-        # Blend with default values based on auto_tune_strength
-        # Default values for vibrant but natural colors
-        default_red = 1.1   # Moderate red boost
+        # Default values with no red boost
+        default_red = 0.95   # Slight red reduction by default
         default_blue = 1.25  # Moderate blue boost
         default_green = 0.95  # Preserve more green
         
@@ -367,10 +437,10 @@ class AutoColorUnderwaterImageProcessor:
         blue_boost = default_blue * (1.0 - self.auto_tune_strength) + optimal_blue_boost * self.auto_tune_strength
         green_factor = default_green * (1.0 - self.auto_tune_strength) + optimal_green_factor * self.auto_tune_strength
         
-        # Clamp to reasonable ranges
-        red_boost = np.clip(red_boost, 1.0, 1.3)
-        blue_boost = np.clip(blue_boost, 1.15, 1.5)  # Lower maximum blue boost
-        green_factor = np.clip(green_factor, 0.85, 1.05)
+        # Clamp to reasonable ranges - allow more red reduction
+        red_boost = np.clip(red_boost, 0.8, 1.1)  # Allow even more red reduction
+        blue_boost = np.clip(blue_boost, 1.15, 1.5)
+        green_factor = np.clip(green_factor, 0.85, 1.15)  # Allow more green boost
         
         return red_boost, blue_boost, green_factor
 
@@ -423,28 +493,58 @@ class AutoColorUnderwaterImageProcessor:
         # Apply CLAHE to L channel for adaptive contrast enhancement
         l_enhanced = self.clahe.apply(l)
         
-        # Step 3: Color correction in LAB space - balanced to reduce red tint and moderate blue
-        # Shift a channel (green-red axis) - reduced red shift
-        a_shifted = cv2.addWeighted(a, 1.0, np.ones_like(a) * 128, 0.0, 2.0)
+        # Step 3: Color correction in LAB space
+        # Get mean a value (red-green axis)
+        mean_a = np.mean(a) - 128  # Center around 0
         
-        # Shift b channel (blue-yellow axis) - moderate blue for more natural ocean colors
-        b_shifted = cv2.addWeighted(b, 1.0, np.ones_like(b) * 128, 0.0, -4.0)  # Reduced from -5.0
+        # Determine a-channel shift based on red tint detection
+        if self.has_red_tinted_rocks:
+            # Strong green shift for red-tinted rocks
+            a_shift_value = -8.0  # Stronger correction for rock scenes
+        elif mean_a > 3:
+            # Moderate green shift for general red tint
+            a_shift_value = -5.0
+        else:
+            # Slight green shift otherwise to prevent reddish tones
+            a_shift_value = -2.0
+            
+        # Apply shift to a channel (green-red axis)
+        a_shifted = cv2.addWeighted(a, 1.0, np.ones_like(a) * 128, 0.0, a_shift_value)
+        
+        # Shift b channel (blue-yellow axis)
+        b_shifted = cv2.addWeighted(b, 1.0, np.ones_like(b) * 128, 0.0, -4.0)
         
         # Merge LAB channels and convert back to BGR
         enhanced_lab = cv2.merge([l_enhanced, a_shifted, b_shifted])
         enhanced_bgr = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
         
-        # Step 4: Apply automatically tuned red-blue color boost
+        # Step 4: Apply automatically tuned RGB channel adjustments
         enhanced_bgr = self._boost_rgb_channels(enhanced_bgr)
         
-        # Step 5: Apply vibrance enhancement - increases saturation of less-saturated colors 
-        # while preserving already saturated areas and skin tones
+        # Step 5: Apply vibrance enhancement (smart saturation)
         enhanced_bgr = self._apply_vibrance(enhanced_bgr, factor=0.5)
         
         # Step 6: Adjust saturation and brightness in HSV space
         enhanced_hsv = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2HSV)
         h, s, v = cv2.split(enhanced_hsv)
         
+        # NEW: Adjust hue to further address red tint if needed
+        if self.has_red_tinted_rocks:
+            # Create a mask for reddish hues (0-10 and 170-180)
+            lower_red_mask = (h < 10)
+            upper_red_mask = (h > 170)
+            red_mask = lower_red_mask | upper_red_mask
+            
+            # Shift red hues slightly towards yellow/orange for more natural rock colors
+            h_modified = h.copy()
+            # For lower red hues, shift towards orange
+            h_modified[lower_red_mask] = np.clip(h_modified[lower_red_mask] + 5, 0, 179)
+            # For upper red hues, shift towards orange
+            h_modified[upper_red_mask] = np.clip(h_modified[upper_red_mask] - 5, 0, 179)
+            
+            # Apply the modified hues
+            h = h_modified
+            
         # Apply enhanced saturation with protection for already saturated areas
         adjusted_saturation = self.saturation_factor * 1.3
         s = np.clip(s * adjusted_saturation, 0, 255).astype(np.uint8)
@@ -519,12 +619,24 @@ class AutoColorUnderwaterImageProcessor:
         # Apply mild histogram equalization to match target distribution
         b_eq = cv2.equalizeHist(b)
         r_eq = cv2.equalizeHist(r)
-        g_eq = cv2.equalizeHist(g)  # Also equalize green for more vibrance
+        g_eq = cv2.equalizeHist(g)
         
-        # Blend equalized image with original - balanced for vibrant natural colors
-        b_final = cv2.addWeighted(b, 0.5, b_eq, 0.5, 0)  # Reduced blue equalization
-        r_final = cv2.addWeighted(r, 0.75, r_eq, 0.25, 0)  # Less red equalization
-        g_final = cv2.addWeighted(g, 0.6, g_eq, 0.4, 0)  # More green equalization for vibrance
+        # Blending settings depend on rock detection
+        if self.has_red_tinted_rocks:
+            # For rock scenes, minimize red equalization and boost greens more
+            r_blend = 0.95  # Only 5% red equalization 
+            g_blend = 0.5   # 50% green equalization for better balance
+            b_blend = 0.6   # 40% blue equalization
+        else:
+            # Standard blending for normal scenes
+            r_blend = 0.9   # 10% red equalization
+            g_blend = 0.6   # 40% green equalization
+            b_blend = 0.5   # 50% blue equalization
+            
+        # Apply the blending
+        b_final = cv2.addWeighted(b, b_blend, b_eq, 1.0 - b_blend, 0)
+        r_final = cv2.addWeighted(r, r_blend, r_eq, 1.0 - r_blend, 0)
+        g_final = cv2.addWeighted(g, g_blend, g_eq, 1.0 - g_blend, 0)
         
         # Create the final image with adjusted channels
         result = cv2.merge([b_final, g_final, r_final])
@@ -938,6 +1050,9 @@ class AutoColorUnderwaterImageProcessor:
                 
                 # Create necessary subdirectories
                 os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                
+                # Reset optimization state for each new file
+                self.has_optimized_params = False
                 
                 if is_image_file(input_file):
                     logger.info(f"Processing image: {input_file}")
