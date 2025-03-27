@@ -140,10 +140,10 @@ class AutoColorUnderwaterImageProcessor:
             '-i', frames_path,
             '-c:v', 'libx265',  # Use HEVC codec 
             '-preset', 'slow',  # Use slow preset for better quality/compression ratio
-            '-crf', str(crf),  # Lower CRF value for better quality (default lowered to 24)
+            '-crf', str(crf),  # Lower CRF value for better quality
             '-pix_fmt', 'yuv420p',
             '-threads', str(num_workers),
-            '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,setdar=1/1,setsar=1/1',
+            '-vf', f'scale=-2:{height},setdar=1/1,setsar=1/1',
             '-tag:v', 'hvc1',  # Ensure compatibility with Apple devices
             '-movflags', '+faststart',
             output_path
