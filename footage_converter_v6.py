@@ -7,7 +7,6 @@ import tempfile
 from pathlib import Path
 import subprocess
 import piexif
-from PIL import Image
 from tqdm import tqdm
 import logging
 import time
@@ -15,17 +14,13 @@ import multiprocessing
 import signal
 import sys
 import re
-import math
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Tuple, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 from sklearn.cluster import KMeans
 from utils import (
     is_image_file, is_video_file, is_quicktime_format,
     check_exiftool_available, verify_location_metadata,
     get_exiftool_cmd_for_metadata_copy, fix_quicktime_metadata,
-    copy_all_metadata_with_exiftool, test_location_preservation,
-    IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, SUPPORTED_EXTENSIONS,
-    QUICKTIME_EXTENSIONS
+    copy_all_metadata_with_exiftool, test_location_preservation, SUPPORTED_EXTENSIONS
 )
 
 # Configure logging

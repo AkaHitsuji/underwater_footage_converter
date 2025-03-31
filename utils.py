@@ -1,11 +1,8 @@
-import cv2
-import numpy as np
 import os
 import subprocess
 import json
 import logging
-from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 # Configure logging
 logging.basicConfig(
