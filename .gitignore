@@ -26,12 +26,12 @@ env/
 *.png
 
 # Ignore test media files, but keep the directories
-test_videos/*
-!test_videos/.gitkeep
-test_images/*
-!test_images/.gitkeep
-test_batch/*
-!test_batch/.gitkeep
+test/test_videos/*
+!test/test_videos/.gitkeep
+test/test_images/*
+!test/test_images/.gitkeep
+test/test_batch/*
+!test/test_batch/.gitkeep
 
 # Ignore temporary processing files
 .DS_Store
