@@ -254,7 +254,7 @@ def test_location_preservation(input_file: str) -> bool:
         
     try:
         # Process the file
-        from footage_converter_v6 import AutoColorUnderwaterImageProcessor
+        from footage_converter import AutoColorUnderwaterImageProcessor
         processor = AutoColorUnderwaterImageProcessor()
         
         if is_image_file(input_file):
